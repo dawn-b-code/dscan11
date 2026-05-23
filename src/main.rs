@@ -5,17 +5,20 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dscan11::{
-    CacheUsageEventKind, CategoryConfigBootstrap, CliError, NavigationTarget, OutputMode,
-    StaleInfo, cache_paths, discover_default_roots, fast_forward_cache, init_category_config,
-    load_category_rules, load_or_default_config, load_snapshot, open_cached_path, print_browse,
-    print_cleanup_journal, print_config, print_files, print_folders, print_json, print_status,
-    print_summary, record_cache_usage, restore_base_cache, roots_match, save_config,
-    save_full_scan, scan_paths,
+    CachePaths, CacheUsageEventKind, CategoryConfigBootstrap, CliError, NavigationTarget,
+    OutputMode, StaleInfo, WorkspaceView, cache_paths, cache_paths_for_workspace, create_workspace,
+    current_workspace, delete_workspace, discover_default_roots, fast_forward_cache,
+    init_category_config, list_workspaces, load_category_rules, load_or_default_config,
+    load_snapshot, open_cached_path, print_browse, print_cleanup_journal, print_config,
+    print_files, print_folders, print_json, print_status, print_summary, record_cache_usage,
+    rename_workspace, restore_base_cache, roots_match, save_config, save_full_scan, scan_paths,
+    use_workspace, validate_workspace_name, workspace_exists,
 };
 
 struct Cli {
     json: bool,
     limit: usize,
+    workspace: Option<String>,
     command: Commands,
 }
 
@@ -41,12 +44,24 @@ enum Commands {
         stale_days: Option<u64>,
         init_categories: bool,
     },
+    Workspace {
+        action: WorkspaceAction,
+    },
 }
 
 enum CacheAction {
     RestoreBase,
     FastForward,
     Cleanups,
+}
+
+enum WorkspaceAction {
+    List,
+    Current,
+    Create { name: String },
+    Use { name: String },
+    Rename { old_name: String, new_name: String },
+    Delete { name: String, force: bool },
 }
 
 fn main() {
@@ -58,7 +73,10 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let cli = parse_cli(std::env::args().skip(1).collect())?;
-    let paths = cache_paths()?;
+    let paths = match &cli.command {
+        Commands::Workspace { .. } => cache_paths()?,
+        _ => cache_paths_for_workspace(cli.workspace.as_deref())?,
+    };
     let mut config = load_or_default_config(&paths)?;
     let output = OutputMode::from_json(cli.json);
 
@@ -75,6 +93,12 @@ fn run() -> Result<(), CliError> {
             };
             let top_limit = top.unwrap_or(config.top_limit).max(1);
             let category_rules = load_category_rules(&paths)?;
+            let mut paths = paths;
+            if let Ok(snapshot) = load_snapshot(&paths) {
+                if !roots_match(&roots, &snapshot.roots) {
+                    paths = handle_scan_root_mismatch(&paths, &roots, output)?;
+                }
+            }
             if !force {
                 if let Ok(snapshot) = load_snapshot(&paths) {
                     let stale = snapshot.stale_info(config.stale_days);
@@ -192,8 +216,182 @@ fn run() -> Result<(), CliError> {
             }
             print_config(&config, &paths, output)?;
         }
+        Commands::Workspace { action } => match action {
+            WorkspaceAction::List => {
+                let workspaces = list_workspaces(&paths)?;
+                print_workspace_list(&workspaces, output)?;
+            }
+            WorkspaceAction::Current => {
+                let workspace = current_workspace(&paths)?;
+                print_workspace_current(&workspace, output)?;
+            }
+            WorkspaceAction::Create { name } => {
+                let workspace = create_workspace(&paths, &name)?;
+                print_workspace_created(&workspace, output)?;
+            }
+            WorkspaceAction::Use { name } => {
+                let workspace = use_workspace(&paths, &name)?;
+                print_workspace_used(&workspace, output)?;
+            }
+            WorkspaceAction::Rename { old_name, new_name } => {
+                rename_workspace(&paths, &old_name, &new_name)?;
+                if output.is_json() {
+                    print_json(&serde_json::json!({
+                        "renamed": true,
+                        "old_name": old_name,
+                        "new_name": new_name,
+                    }))?;
+                } else {
+                    println!("Renamed workspace `{old_name}` to `{new_name}`.");
+                }
+            }
+            WorkspaceAction::Delete { name, force } => {
+                if !force && !output.is_json() && io::stdin().is_terminal() {
+                    print!(
+                        "Delete workspace `{name}` and its cache files? This cannot be undone. [y/N]: "
+                    );
+                    io::stdout().flush().map_err(|source| CliError::Io {
+                        context: "failed to flush stdout".to_string(),
+                        source,
+                    })?;
+                    if !matches!(
+                        read_line_trimmed()?.to_ascii_lowercase().as_str(),
+                        "y" | "yes"
+                    ) {
+                        println!("Workspace delete cancelled.");
+                        return Ok(());
+                    }
+                    delete_workspace(&paths, &name, true)?;
+                } else {
+                    delete_workspace(&paths, &name, force)?;
+                }
+                if output.is_json() {
+                    print_json(&serde_json::json!({
+                        "deleted": true,
+                        "name": name,
+                    }))?;
+                } else {
+                    println!("Deleted workspace `{name}`.");
+                }
+            }
+        },
     }
 
+    Ok(())
+}
+
+fn handle_scan_root_mismatch(
+    paths: &CachePaths,
+    roots: &[PathBuf],
+    output: OutputMode,
+) -> Result<CachePaths, CliError> {
+    if output.is_json() || !io::stdin().is_terminal() {
+        return Err(CliError::Message(format!(
+            "scan roots differ from workspace `{}`; create or select another workspace before scanning this scope",
+            paths.workspace_name
+        )));
+    }
+
+    eprintln!(
+        "Scan roots differ from workspace `{}`. One workspace tracks one scan scope.",
+        paths.workspace_name
+    );
+    eprintln!("Requested roots: {}", display_roots(roots));
+    print!("New workspace name for this scan, or blank to cancel: ");
+    io::stdout().flush().map_err(|source| CliError::Io {
+        context: "failed to flush stdout".to_string(),
+        source,
+    })?;
+    let name = read_line_trimmed()?;
+    if name.is_empty() {
+        return Err(CliError::Message("scan cancelled".to_string()));
+    }
+    validate_workspace_name(&name)?;
+    if !workspace_exists(paths, &name)? {
+        create_workspace(paths, &name)?;
+    }
+    let target_paths = cache_paths_for_workspace(Some(&name))?;
+    if let Ok(snapshot) = load_snapshot(&target_paths) {
+        if !roots_match(roots, &snapshot.roots) {
+            return Err(CliError::Message(format!(
+                "scan roots also differ from workspace `{name}`; choose an empty workspace or one with matching roots"
+            )));
+        }
+    }
+    use_workspace(paths, &name)?;
+    Ok(target_paths)
+}
+
+fn read_line_trimmed() -> Result<String, CliError> {
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|source| CliError::Io {
+            context: "failed to read input".to_string(),
+            source,
+        })?;
+    Ok(value.trim().to_string())
+}
+
+fn display_roots(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_workspace_list(workspaces: &[WorkspaceView], output: OutputMode) -> Result<(), CliError> {
+    if output.is_json() {
+        return print_json(workspaces);
+    }
+    println!("Workspaces");
+    for workspace in workspaces {
+        println!(
+            "  {}{}{}",
+            if workspace.active { "* " } else { "  " },
+            workspace.name,
+            if workspace.has_snapshot {
+                ""
+            } else {
+                " (empty)"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn print_workspace_current(workspace: &WorkspaceView, output: OutputMode) -> Result<(), CliError> {
+    if output.is_json() {
+        return print_json(workspace);
+    }
+    println!("Current workspace: {}", workspace.name);
+    println!("  cache: {}", workspace.cache_dir);
+    println!(
+        "  snapshot: {}",
+        if workspace.has_snapshot {
+            "present"
+        } else {
+            "not scanned yet"
+        }
+    );
+    Ok(())
+}
+
+fn print_workspace_created(workspace: &WorkspaceView, output: OutputMode) -> Result<(), CliError> {
+    if output.is_json() {
+        return print_json(workspace);
+    }
+    println!("Created workspace `{}`.", workspace.name);
+    println!("Use it with `dscan11 workspace use {}`.", workspace.name);
+    Ok(())
+}
+
+fn print_workspace_used(workspace: &WorkspaceView, output: OutputMode) -> Result<(), CliError> {
+    if output.is_json() {
+        return print_json(workspace);
+    }
+    println!("Using workspace `{}`.", workspace.name);
     Ok(())
 }
 
@@ -274,6 +472,7 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
 
     let mut json = false;
     let mut limit = 40usize;
+    let mut workspace = None;
     let mut positional = Vec::new();
     let mut index = 0;
 
@@ -290,6 +489,14 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
                 limit = value.parse().map_err(|_| {
                     CliError::Message("--limit must be a positive integer".to_string())
                 })?;
+                index += 2;
+            }
+            "--workspace" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    CliError::Message("--workspace requires a workspace name".to_string())
+                })?;
+                validate_workspace_name(value)?;
+                workspace = Some(value.to_string());
                 index += 2;
             }
             arg => {
@@ -410,6 +617,94 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
                 init_categories,
             }
         }
+        "workspace" | "workspaces" => {
+            if rest.is_empty() {
+                return Err(CliError::Message(
+                    "workspace requires `list`, `current`, `create`, `use`, `rename`, or `delete`; run `dscan11 --help`"
+                        .to_string(),
+                ));
+            }
+            let action = match rest[0].as_str() {
+                "list" | "ls" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Message(
+                            "workspace list does not accept arguments".to_string(),
+                        ));
+                    }
+                    WorkspaceAction::List
+                }
+                "current" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Message(
+                            "workspace current does not accept arguments".to_string(),
+                        ));
+                    }
+                    WorkspaceAction::Current
+                }
+                "create" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Message(
+                            "workspace create requires a workspace name".to_string(),
+                        ));
+                    }
+                    validate_workspace_name(&rest[1])?;
+                    WorkspaceAction::Create {
+                        name: rest[1].clone(),
+                    }
+                }
+                "use" => {
+                    if rest.len() != 2 {
+                        return Err(CliError::Message(
+                            "workspace use requires a workspace name".to_string(),
+                        ));
+                    }
+                    validate_workspace_name(&rest[1])?;
+                    WorkspaceAction::Use {
+                        name: rest[1].clone(),
+                    }
+                }
+                "rename" => {
+                    if rest.len() != 3 {
+                        return Err(CliError::Message(
+                            "workspace rename requires OLD and NEW workspace names".to_string(),
+                        ));
+                    }
+                    validate_workspace_name(&rest[1])?;
+                    validate_workspace_name(&rest[2])?;
+                    WorkspaceAction::Rename {
+                        old_name: rest[1].clone(),
+                        new_name: rest[2].clone(),
+                    }
+                }
+                "delete" | "remove" | "rm" => {
+                    let mut force = false;
+                    let mut names = Vec::new();
+                    for arg in &rest[1..] {
+                        if arg == "--force" {
+                            force = true;
+                        } else {
+                            names.push(arg.clone());
+                        }
+                    }
+                    if names.len() != 1 {
+                        return Err(CliError::Message(
+                            "workspace delete requires one workspace name".to_string(),
+                        ));
+                    }
+                    validate_workspace_name(&names[0])?;
+                    WorkspaceAction::Delete {
+                        name: names.remove(0),
+                        force,
+                    }
+                }
+                other => {
+                    return Err(CliError::Message(format!(
+                        "unknown workspace action `{other}`; use `list`, `current`, `create`, `use`, `rename`, or `delete`"
+                    )));
+                }
+            };
+            Commands::Workspace { action }
+        }
         other => {
             return Err(CliError::Message(format!(
                 "unknown command `{other}`; run `dscan11 --help`"
@@ -420,6 +715,7 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
     Ok(Cli {
         json,
         limit: limit.max(1),
+        workspace,
         command,
     })
 }
@@ -428,9 +724,9 @@ fn print_help() {
     print!(
         r#"dscan11 - cached Windows drive scanner
 
-Scans one or more directories, stores a snapshot under %LOCALAPPDATA%\dscan11,
-and serves later summary, file, folder, navigation, status, and config
-views from that cache without rescanning.
+Scans one or more directories, stores workspace snapshots under
+%LOCALAPPDATA%\dscan11\workspaces, and serves later summary, file, folder,
+navigation, status, and config views from that cache without rescanning.
 
 Usage:
   dscan11 [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
@@ -440,6 +736,11 @@ Usage:
 Global options:
   --json
       Print machine-readable JSON for commands that display data.
+
+  --workspace NAME
+      Use a specific workspace for this command without changing the globally
+      active workspace. Workspace names may contain only letters, numbers,
+      dots, dashes, and underscores.
 
   --limit N
       Limit rows displayed by summary, files, and folders.
@@ -557,7 +858,10 @@ Commands:
 
       --init-categories
           Create %LOCALAPPDATA%\dscan11\categories.json from built-in defaults.
-          Existing category configs are not overwritten.
+          Existing category configs are not overwritten. The file contains
+          extension categories plus optional path_rules for storage roots such
+          as Ollama models and Docker containers. Path rules run before
+          extension rules.
 
       Examples:
           dscan11 config
@@ -566,25 +870,72 @@ Commands:
           dscan11 --json config
           dscan11 --json config --init-categories
 
+  workspace list
+      List known workspaces and mark the active workspace.
+
+      Examples:
+          dscan11 workspace list
+          dscan11 --json workspace list
+
+  workspace current
+      Show the globally active workspace.
+
+      Examples:
+          dscan11 workspace current
+
+  workspace create NAME
+      Create an empty workspace. Workspace names may contain only letters,
+      numbers, dots, dashes, and underscores.
+
+      Examples:
+          dscan11 workspace create media
+
+  workspace use NAME
+      Make a workspace the global default for later commands.
+
+      Examples:
+          dscan11 workspace use media
+
+  workspace rename OLD NEW
+      Rename a workspace and its cache directory.
+
+      Examples:
+          dscan11 workspace rename media archive-media
+
+  workspace delete [--force] NAME
+      Delete a workspace. Interactive terminals ask for confirmation; scripts
+      and JSON mode require --force when cache files exist.
+
+      Examples:
+          dscan11 workspace delete old-media
+          dscan11 workspace delete --force old-media
+
 Cache and config:
-  Cache directory:
+  App directory:
       %LOCALAPPDATA%\dscan11
 
+  Workspace registry:
+      %LOCALAPPDATA%\dscan11\workspaces.json
+
+  Workspace cache directory:
+      %LOCALAPPDATA%\dscan11\workspaces\NAME
+
   Snapshot:
-      %LOCALAPPDATA%\dscan11\snapshot.json
+      %LOCALAPPDATA%\dscan11\workspaces\NAME\snapshot.json
 
   Base snapshot:
-      %LOCALAPPDATA%\dscan11\base-snapshot.json
+      %LOCALAPPDATA%\dscan11\workspaces\NAME\base-snapshot.json
 
   Journals:
-      %LOCALAPPDATA%\dscan11\cleanup-journal.jsonl
-      %LOCALAPPDATA%\dscan11\cache-usage-journal.jsonl
+      %LOCALAPPDATA%\dscan11\workspaces\NAME\cleanup-journal.jsonl
+      %LOCALAPPDATA%\dscan11\workspaces\NAME\cache-usage-journal.jsonl
 
   Config:
       %LOCALAPPDATA%\dscan11\config.json
 
   Category config:
       %LOCALAPPDATA%\dscan11\categories.json
+      Optional path_rules classify known storage roots before extensions.
 
   Defaults:
       stale_days: 15
@@ -595,6 +946,9 @@ Important behavior:
   - Cache savings are estimates based on the latest full scan scope.
   - open and browse navigation use cached file and folder ranks.
   - Fresh cached scans ask before rescanning unless --force is used.
+  - A workspace tracks one scan scope; scan roots that differ from an existing
+    workspace prompt in terminals and fail in scripts.
+  - Existing singleton cache files are adopted into workspace `default`.
   - --top controls how much scan data is stored.
   - --limit controls how much cached data is displayed.
   - Global options must appear before the command.

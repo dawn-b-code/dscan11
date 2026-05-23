@@ -141,7 +141,7 @@ fn forced_full_scan_resets_active_journals_for_new_base() {
         status["cache_savings"]["counted_readouts"].as_u64(),
         Some(0)
     );
-    let dscan = cache.join("dscan11");
+    let dscan = cache.join("dscan11").join("workspaces").join("default");
     assert!(
         std::fs::read_dir(&dscan)
             .expect("read cache dir")
@@ -293,6 +293,46 @@ fn config_init_categories_creates_default_category_config() {
             .any(|value| value == "pdf"),
         true
     );
+    assert_eq!(
+        categories["path_rules"]["AI Models"]
+            .as_array()
+            .expect("AI Models path rules")
+            .iter()
+            .any(|value| value == ".ollama/models"),
+        true
+    );
+    assert_eq!(
+        categories["path_rules"]["Docker / Containers"]
+            .as_array()
+            .expect("Docker path rules")
+            .iter()
+            .any(|value| value == "ProgramData/docker/containers"),
+        true
+    );
+}
+
+#[test]
+fn scan_classifies_path_rule_storage_roots() {
+    let cache = temp_dir("path-rules-cache");
+    let tree = temp_dir("path-rules-tree");
+    let ollama_blobs = tree.join(".ollama").join("models").join("blobs");
+    let docker_data = tree.join(".docker").join("desktop").join("vm-data");
+    std::fs::create_dir_all(&ollama_blobs).expect("create ollama dirs");
+    std::fs::create_dir_all(&docker_data).expect("create docker dirs");
+    std::fs::write(ollama_blobs.join("sha256-abc"), vec![0; 4_096]).expect("write model blob");
+    std::fs::write(docker_data.join("ext4.vhdx"), vec![0; 8_192]).expect("write docker vhdx");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache).arg("scan").arg(&tree);
+    assert_success(scan, "Scan status");
+
+    let mut summary = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    summary.env("LOCALAPPDATA", &cache).arg("summary");
+    assert_success(summary, "AI Models");
+
+    let mut summary = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    summary.env("LOCALAPPDATA", &cache).arg("summary");
+    assert_success(summary, "Docker / Containers");
 }
 
 #[test]
@@ -360,8 +400,235 @@ fn scan_missing_root_fails_without_cache_snapshot() {
         "unexpected stderr:\n{stderr}"
     );
     assert!(
-        !cache.join("dscan11").join("snapshot.json").exists(),
+        !cache
+            .join("dscan11")
+            .join("workspaces")
+            .join("default")
+            .join("snapshot.json")
+            .exists(),
         "failed scan should not save a snapshot"
+    );
+}
+
+#[test]
+fn legacy_singleton_cache_is_adopted_as_default_workspace() {
+    let cache = temp_dir("legacy-cache");
+    let tree = temp_dir("legacy-tree");
+    std::fs::write(tree.join("legacy.iso"), vec![0; 4_096]).expect("write legacy");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache).arg("scan").arg(&tree);
+    assert_success(scan, "Scan status");
+
+    let app = cache.join("dscan11");
+    let default = app.join("workspaces").join("default");
+    for name in [
+        "snapshot.json",
+        "base-snapshot.json",
+        "cleanup-journal.jsonl",
+        "cache-usage-journal.jsonl",
+    ] {
+        let from = default.join(name);
+        if from.exists() {
+            std::fs::rename(&from, app.join(name)).expect("restore legacy file");
+        }
+    }
+    std::fs::remove_file(app.join("workspaces.json")).expect("remove registry");
+    std::fs::remove_dir_all(app.join("workspaces")).expect("remove workspaces dir");
+
+    let status = status_json(&cache);
+    assert_eq!(status["workspace"].as_str(), Some("default"));
+    assert!(
+        app.join("workspaces")
+            .join("default")
+            .join("snapshot.json")
+            .exists(),
+        "legacy snapshot should move into default workspace"
+    );
+}
+
+#[test]
+fn workspaces_keep_independent_scan_caches() {
+    let cache = temp_dir("multi-cache");
+    let media = temp_dir("media-tree");
+    let docs = temp_dir("docs-tree");
+    std::fs::write(media.join("movie.mkv"), vec![0; 6_144]).expect("write movie");
+    std::fs::write(docs.join("paper.pdf"), vec![0; 2_048]).expect("write paper");
+
+    let mut create_media = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    create_media
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("create")
+        .arg("media");
+    assert_success(create_media, "Created workspace");
+
+    let mut scan_media = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan_media
+        .env("LOCALAPPDATA", &cache)
+        .arg("--workspace")
+        .arg("media")
+        .arg("scan")
+        .arg(&media);
+    assert_success(scan_media, "Scan status");
+
+    let mut create_docs = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    create_docs
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("create")
+        .arg("docs");
+    assert_success(create_docs, "Created workspace");
+
+    let mut scan_docs = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan_docs
+        .env("LOCALAPPDATA", &cache)
+        .arg("--workspace")
+        .arg("docs")
+        .arg("scan")
+        .arg(&docs);
+    assert_success(scan_docs, "Scan status");
+
+    let mut media_files = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    media_files
+        .env("LOCALAPPDATA", &cache)
+        .arg("--workspace")
+        .arg("media")
+        .arg("files");
+    assert_success(media_files, "movie.mkv");
+
+    let mut docs_files = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    docs_files
+        .env("LOCALAPPDATA", &cache)
+        .arg("--workspace")
+        .arg("docs")
+        .arg("files");
+    assert_success(docs_files, "paper.pdf");
+}
+
+#[test]
+fn workspace_override_does_not_change_active_workspace() {
+    let cache = temp_dir("override-cache");
+    let tree = temp_dir("override-tree");
+    std::fs::write(tree.join("movie.mkv"), vec![0; 1_024]).expect("write movie");
+
+    let mut create = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    create
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("create")
+        .arg("media");
+    assert_success(create, "Created workspace");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache)
+        .arg("--workspace")
+        .arg("media")
+        .arg("scan")
+        .arg(&tree);
+    assert_success(scan, "Scan status");
+
+    let current = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("workspace")
+        .arg("current")
+        .output()
+        .expect("run current");
+    assert!(current.status.success(), "current workspace failed");
+    let json: serde_json::Value =
+        serde_json::from_slice(&current.stdout).expect("current emits JSON");
+    assert_eq!(json["name"].as_str(), Some("default"));
+}
+
+#[test]
+fn invalid_workspace_names_are_rejected_with_hint() {
+    for name in ["", ".", "..", "media/photos", "bad name", "oops!"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+            .arg("workspace")
+            .arg("create")
+            .arg(name)
+            .output()
+            .expect("run workspace create");
+        assert!(!output.status.success(), "name {name:?} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("invalid workspace name"),
+            "unexpected stderr for {name:?}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn workspace_lifecycle_commands_work() {
+    let cache = temp_dir("lifecycle-cache");
+
+    let mut create = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    create
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("create")
+        .arg("draft");
+    assert_success(create, "Created workspace");
+
+    let mut rename = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    rename
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("rename")
+        .arg("draft")
+        .arg("archive");
+    assert_success(rename, "Renamed workspace");
+
+    let mut use_workspace = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    use_workspace
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("use")
+        .arg("archive");
+    assert_success(use_workspace, "Using workspace");
+
+    let mut switch_default = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    switch_default
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("use")
+        .arg("default");
+    assert_success(switch_default, "Using workspace");
+
+    let mut delete = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    delete
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("delete")
+        .arg("--force")
+        .arg("archive");
+    assert_success(delete, "Deleted workspace");
+}
+
+#[test]
+fn scan_root_mismatch_fails_in_noninteractive_mode() {
+    let cache = temp_dir("mismatch-cache");
+    let first = temp_dir("mismatch-first");
+    let second = temp_dir("mismatch-second");
+    std::fs::write(first.join("first.txt"), vec![0; 1_024]).expect("write first");
+    std::fs::write(second.join("second.txt"), vec![0; 1_024]).expect("write second");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache).arg("scan").arg(&first);
+    assert_success(scan, "Scan status");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("scan")
+        .arg(&second)
+        .output()
+        .expect("run mismatch scan");
+    assert!(!output.status.success(), "mismatch scan should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("scan roots differ from workspace `default`"),
+        "unexpected stderr:\n{stderr}"
     );
 }
 
@@ -397,6 +664,7 @@ fn help_documents_commands_flags_and_examples() {
     for needle in [
         "Usage:",
         "Global options:",
+        "--workspace NAME",
         "Commands:",
         "scan [--force] [--top N] [paths...]",
         "summary",
@@ -407,6 +675,9 @@ fn help_documents_commands_flags_and_examples() {
         "browse",
         "cache restore-base",
         "cache fast-forward",
+        "workspace list",
+        "workspace create NAME",
+        "workspace delete [--force] NAME",
         "status",
         "config [--stale-days DAYS] [--init-categories]",
         "--top controls how much scan data is stored.",

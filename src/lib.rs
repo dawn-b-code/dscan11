@@ -15,6 +15,9 @@ const SNAPSHOT_VERSION: u32 = 3;
 const DEFAULT_STALE_DAYS: u64 = 15;
 const DEFAULT_TOP_LIMIT: usize = 1_000;
 const APP_DIR_NAME: &str = "dscan11";
+const WORKSPACES_DIR_NAME: &str = "workspaces";
+const WORKSPACE_REGISTRY_FILE: &str = "workspaces.json";
+pub const DEFAULT_WORKSPACE_NAME: &str = "default";
 
 #[derive(Debug)]
 pub enum CliError {
@@ -68,7 +71,11 @@ impl OutputMode {
 
 #[derive(Debug, Clone)]
 pub struct CachePaths {
+    pub app_dir: PathBuf,
     pub base_dir: PathBuf,
+    pub workspaces_dir: PathBuf,
+    pub workspace_registry_path: PathBuf,
+    pub workspace_name: String,
     pub config_path: PathBuf,
     pub category_config_path: PathBuf,
     pub snapshot_path: PathBuf,
@@ -78,6 +85,10 @@ pub struct CachePaths {
 }
 
 pub fn cache_paths() -> Result<CachePaths, CliError> {
+    cache_paths_for_workspace(None)
+}
+
+pub fn cache_paths_for_workspace(workspace: Option<&str>) -> Result<CachePaths, CliError> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| {
@@ -88,15 +99,374 @@ pub fn cache_paths() -> Result<CachePaths, CliError> {
             CliError::Message("unable to locate LOCALAPPDATA or USERPROFILE".to_string())
         })?;
 
-    let base_dir = base.join(APP_DIR_NAME);
+    let app_dir = base.join(APP_DIR_NAME);
+    migrate_legacy_cache(&app_dir)?;
+    let mut registry = load_or_init_workspace_registry(&app_dir)?;
+    let workspace_name = match workspace {
+        Some(name) => {
+            validate_workspace_name(name)?;
+            if !registry.workspaces.contains_key(name) {
+                return Err(CliError::Message(format!(
+                    "workspace `{name}` does not exist; run `dscan11 workspace create {name}` first"
+                )));
+            }
+            name.to_string()
+        }
+        None => registry.active.clone(),
+    };
+    validate_workspace_name(&workspace_name)?;
+    if !registry.workspaces.contains_key(&workspace_name) {
+        registry
+            .workspaces
+            .insert(workspace_name.clone(), WorkspaceInfo::new()?);
+        save_workspace_registry(&app_dir, &registry)?;
+    }
+
+    workspace_cache_paths(&app_dir, &workspace_name)
+}
+
+fn workspace_cache_paths(app_dir: &Path, workspace_name: &str) -> Result<CachePaths, CliError> {
+    validate_workspace_name(workspace_name)?;
+    let workspaces_dir = app_dir.join(WORKSPACES_DIR_NAME);
+    let base_dir = workspaces_dir.join(workspace_name);
     Ok(CachePaths {
-        config_path: base_dir.join("config.json"),
-        category_config_path: base_dir.join("categories.json"),
+        config_path: app_dir.join("config.json"),
+        category_config_path: app_dir.join("categories.json"),
         snapshot_path: base_dir.join("snapshot.json"),
         base_snapshot_path: base_dir.join("base-snapshot.json"),
         cleanup_journal_path: base_dir.join("cleanup-journal.jsonl"),
         cache_usage_journal_path: base_dir.join("cache-usage-journal.jsonl"),
+        workspace_registry_path: app_dir.join(WORKSPACE_REGISTRY_FILE),
+        workspace_name: workspace_name.to_string(),
+        workspaces_dir,
+        app_dir: app_dir.to_path_buf(),
         base_dir,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRegistry {
+    pub active: String,
+    pub workspaces: BTreeMap<String, WorkspaceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    pub created_at_unix: u64,
+}
+
+impl WorkspaceInfo {
+    fn new() -> Result<Self, CliError> {
+        Ok(Self {
+            created_at_unix: current_unix()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceView {
+    pub name: String,
+    pub active: bool,
+    pub cache_dir: String,
+    pub has_snapshot: bool,
+    pub created_at_unix: u64,
+}
+
+fn workspace_registry_path(app_dir: &Path) -> PathBuf {
+    app_dir.join(WORKSPACE_REGISTRY_FILE)
+}
+
+fn load_or_init_workspace_registry(app_dir: &Path) -> Result<WorkspaceRegistry, CliError> {
+    match fs::read_to_string(workspace_registry_path(app_dir)) {
+        Ok(contents) => {
+            let registry: WorkspaceRegistry =
+                serde_json::from_str(&contents).map_err(|source| CliError::Json {
+                    context: format!(
+                        "failed to parse workspace registry {}",
+                        workspace_registry_path(app_dir).display()
+                    ),
+                    source,
+                })?;
+            validate_workspace_name(&registry.active)?;
+            for name in registry.workspaces.keys() {
+                validate_workspace_name(name)?;
+            }
+            Ok(registry)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let mut workspaces = BTreeMap::new();
+            workspaces.insert(DEFAULT_WORKSPACE_NAME.to_string(), WorkspaceInfo::new()?);
+            let registry = WorkspaceRegistry {
+                active: DEFAULT_WORKSPACE_NAME.to_string(),
+                workspaces,
+            };
+            save_workspace_registry(app_dir, &registry)?;
+            Ok(registry)
+        }
+        Err(source) => Err(CliError::Io {
+            context: format!(
+                "failed to read workspace registry {}",
+                workspace_registry_path(app_dir).display()
+            ),
+            source,
+        }),
+    }
+}
+
+fn save_workspace_registry(app_dir: &Path, registry: &WorkspaceRegistry) -> Result<(), CliError> {
+    fs::create_dir_all(app_dir).map_err(|source| CliError::Io {
+        context: format!("failed to create cache directory {}", app_dir.display()),
+        source,
+    })?;
+    let json = serde_json::to_string_pretty(registry).map_err(|source| CliError::Json {
+        context: "failed to serialize workspace registry".to_string(),
+        source,
+    })?;
+    fs::write(workspace_registry_path(app_dir), json).map_err(|source| CliError::Io {
+        context: format!(
+            "failed to write workspace registry {}",
+            workspace_registry_path(app_dir).display()
+        ),
+        source,
+    })
+}
+
+fn migrate_legacy_cache(app_dir: &Path) -> Result<(), CliError> {
+    if workspace_registry_path(app_dir).exists() {
+        return Ok(());
+    }
+
+    let legacy_files = [
+        "snapshot.json",
+        "base-snapshot.json",
+        "cleanup-journal.jsonl",
+        "cache-usage-journal.jsonl",
+    ];
+    let has_legacy_cache = legacy_files.iter().any(|name| app_dir.join(name).exists());
+    if has_legacy_cache {
+        let default_dir = app_dir
+            .join(WORKSPACES_DIR_NAME)
+            .join(DEFAULT_WORKSPACE_NAME);
+        fs::create_dir_all(&default_dir).map_err(|source| CliError::Io {
+            context: format!(
+                "failed to create default workspace directory {}",
+                default_dir.display()
+            ),
+            source,
+        })?;
+        for file_name in legacy_files {
+            let from = app_dir.join(file_name);
+            if from.exists() {
+                let to = default_dir.join(file_name);
+                if to.exists() {
+                    return Err(CliError::Message(format!(
+                        "cannot migrate legacy cache because {} already exists",
+                        to.display()
+                    )));
+                }
+                fs::rename(&from, &to).map_err(|source| CliError::Io {
+                    context: format!("failed to migrate {} to {}", from.display(), to.display()),
+                    source,
+                })?;
+            }
+        }
+    }
+
+    let mut workspaces = BTreeMap::new();
+    workspaces.insert(DEFAULT_WORKSPACE_NAME.to_string(), WorkspaceInfo::new()?);
+    save_workspace_registry(
+        app_dir,
+        &WorkspaceRegistry {
+            active: DEFAULT_WORKSPACE_NAME.to_string(),
+            workspaces,
+        },
+    )
+}
+
+pub fn validate_workspace_name(name: &str) -> Result<(), CliError> {
+    if name.is_empty() {
+        return Err(CliError::Message(
+            "invalid workspace name \"\"; use letters, numbers, dots, dashes, or underscores only"
+                .to_string(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(CliError::Message(format!(
+            "invalid workspace name \"{name}\"; workspace names cannot be \".\" or \"..\""
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(CliError::Message(format!(
+            "invalid workspace name \"{name}\"; use letters, numbers, dots, dashes, or underscores only"
+        )));
+    }
+    Ok(())
+}
+
+pub fn workspace_exists(paths: &CachePaths, name: &str) -> Result<bool, CliError> {
+    validate_workspace_name(name)?;
+    let registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    Ok(registry.workspaces.contains_key(name))
+}
+
+pub fn create_workspace(paths: &CachePaths, name: &str) -> Result<WorkspaceView, CliError> {
+    validate_workspace_name(name)?;
+    let mut registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    if registry.workspaces.contains_key(name) {
+        return Err(CliError::Message(format!(
+            "workspace `{name}` already exists; run `dscan11 workspace use {name}` to select it"
+        )));
+    }
+    registry
+        .workspaces
+        .insert(name.to_string(), WorkspaceInfo::new()?);
+    let created_paths = workspace_cache_paths(&paths.app_dir, name)?;
+    fs::create_dir_all(&created_paths.base_dir).map_err(|source| CliError::Io {
+        context: format!(
+            "failed to create workspace directory {}",
+            created_paths.base_dir.display()
+        ),
+        source,
+    })?;
+    save_workspace_registry(&paths.app_dir, &registry)?;
+    workspace_view(
+        &paths.app_dir,
+        name,
+        false,
+        registry.workspaces.get(name).expect("created"),
+    )
+}
+
+pub fn use_workspace(paths: &CachePaths, name: &str) -> Result<WorkspaceView, CliError> {
+    validate_workspace_name(name)?;
+    let mut registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    let Some(info) = registry.workspaces.get(name).cloned() else {
+        return Err(CliError::Message(format!(
+            "workspace `{name}` does not exist; run `dscan11 workspace create {name}` first"
+        )));
+    };
+    registry.active = name.to_string();
+    save_workspace_registry(&paths.app_dir, &registry)?;
+    workspace_view(&paths.app_dir, name, true, &info)
+}
+
+pub fn rename_workspace(
+    paths: &CachePaths,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), CliError> {
+    validate_workspace_name(old_name)?;
+    validate_workspace_name(new_name)?;
+    if old_name == new_name {
+        return Err(CliError::Message(format!(
+            "workspace `{old_name}` is already named `{new_name}`"
+        )));
+    }
+    let mut registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    let Some(info) = registry.workspaces.remove(old_name) else {
+        return Err(CliError::Message(format!(
+            "workspace `{old_name}` does not exist"
+        )));
+    };
+    if registry.workspaces.contains_key(new_name) {
+        registry.workspaces.insert(old_name.to_string(), info);
+        return Err(CliError::Message(format!(
+            "workspace `{new_name}` already exists"
+        )));
+    }
+    let old_paths = workspace_cache_paths(&paths.app_dir, old_name)?;
+    let new_paths = workspace_cache_paths(&paths.app_dir, new_name)?;
+    if new_paths.base_dir.exists() {
+        registry.workspaces.insert(old_name.to_string(), info);
+        return Err(CliError::Message(format!(
+            "workspace directory already exists: {}",
+            new_paths.base_dir.display()
+        )));
+    }
+    if old_paths.base_dir.exists() {
+        fs::rename(&old_paths.base_dir, &new_paths.base_dir).map_err(|source| CliError::Io {
+            context: format!(
+                "failed to rename workspace directory {} to {}",
+                old_paths.base_dir.display(),
+                new_paths.base_dir.display()
+            ),
+            source,
+        })?;
+    }
+    registry.workspaces.insert(new_name.to_string(), info);
+    if registry.active == old_name {
+        registry.active = new_name.to_string();
+    }
+    save_workspace_registry(&paths.app_dir, &registry)
+}
+
+pub fn delete_workspace(paths: &CachePaths, name: &str, force: bool) -> Result<(), CliError> {
+    validate_workspace_name(name)?;
+    let mut registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    if registry.active == name {
+        return Err(CliError::Message(format!(
+            "cannot delete active workspace `{name}`; switch workspaces first"
+        )));
+    }
+    if registry.workspaces.remove(name).is_none() {
+        return Err(CliError::Message(format!(
+            "workspace `{name}` does not exist"
+        )));
+    }
+    let target_paths = workspace_cache_paths(&paths.app_dir, name)?;
+    if target_paths.base_dir.exists() {
+        if !force {
+            return Err(CliError::Message(format!(
+                "workspace `{name}` has cache files; rerun with `--force` to delete it"
+            )));
+        }
+        fs::remove_dir_all(&target_paths.base_dir).map_err(|source| CliError::Io {
+            context: format!(
+                "failed to delete workspace directory {}",
+                target_paths.base_dir.display()
+            ),
+            source,
+        })?;
+    }
+    save_workspace_registry(&paths.app_dir, &registry)
+}
+
+pub fn list_workspaces(paths: &CachePaths) -> Result<Vec<WorkspaceView>, CliError> {
+    let registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    registry
+        .workspaces
+        .iter()
+        .map(|(name, info)| workspace_view(&paths.app_dir, name, registry.active == *name, info))
+        .collect()
+}
+
+pub fn current_workspace(paths: &CachePaths) -> Result<WorkspaceView, CliError> {
+    let registry = load_or_init_workspace_registry(&paths.app_dir)?;
+    let Some(info) = registry.workspaces.get(&registry.active) else {
+        return Err(CliError::Message(format!(
+            "active workspace `{}` is missing from the workspace registry",
+            registry.active
+        )));
+    };
+    workspace_view(&paths.app_dir, &registry.active, true, info)
+}
+
+fn workspace_view(
+    app_dir: &Path,
+    name: &str,
+    active: bool,
+    info: &WorkspaceInfo,
+) -> Result<WorkspaceView, CliError> {
+    let paths = workspace_cache_paths(app_dir, name)?;
+    Ok(WorkspaceView {
+        name: name.to_string(),
+        active,
+        cache_dir: paths.base_dir.display().to_string(),
+        has_snapshot: paths.snapshot_path.exists(),
+        created_at_unix: info.created_at_unix,
     })
 }
 
@@ -166,19 +536,33 @@ pub struct CategoryConfigBootstrap {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CategoryConfig {
     pub categories: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub path_rules: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryRules {
+    path_rules: Vec<PathRule>,
     extension_map: HashMap<String, String>,
     fingerprint: String,
     source: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathRule {
+    fragment: String,
+    category: String,
+}
+
 impl CategoryRules {
     pub fn classify(&self, path: &Path) -> String {
-        if has_component(path, "OneDrive") {
-            return "Cloud / OneDrive".to_string();
+        let normalized_path = normalize_path_fragment(&path.display().to_string());
+        if let Some(rule) = self
+            .path_rules
+            .iter()
+            .find(|rule| normalized_path.contains(&rule.fragment))
+        {
+            return rule.category.clone();
         }
 
         let ext = path
@@ -205,6 +589,10 @@ impl CategoryRules {
             return "Temporary / Cache".to_string();
         }
 
+        if has_component(path, "OneDrive") {
+            return "Cloud / OneDrive".to_string();
+        }
+
         "Other".to_string()
     }
 
@@ -226,7 +614,10 @@ impl Default for CategoryConfig {
                 extensions.iter().map(|ext| ext.to_string()).collect(),
             );
         }
-        Self { categories }
+        Self {
+            categories,
+            path_rules: Some(default_path_rules_config()),
+        }
     }
 }
 
@@ -297,13 +688,23 @@ impl CategoryRules {
     pub fn from_config(config: CategoryConfig, source: String) -> Result<Self, CliError> {
         let canonical = normalize_category_config(config)?;
         let mut extension_map = HashMap::new();
-        for (category, extensions) in &canonical {
+        for (category, extensions) in &canonical.categories {
             for extension in extensions {
                 extension_map.insert(extension.clone(), category.clone());
             }
         }
+        let mut path_rules = Vec::new();
+        for (category, fragments) in &canonical.path_rules {
+            for fragment in fragments {
+                path_rules.push(PathRule {
+                    fragment: fragment.clone(),
+                    category: category.clone(),
+                });
+            }
+        }
 
         Ok(Self {
+            path_rules,
             extension_map,
             fingerprint: category_fingerprint(&canonical),
             source,
@@ -311,11 +712,15 @@ impl CategoryRules {
     }
 }
 
-fn normalize_category_config(
-    config: CategoryConfig,
-) -> Result<BTreeMap<String, Vec<String>>, CliError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedCategoryConfig {
+    categories: BTreeMap<String, Vec<String>>,
+    path_rules: BTreeMap<String, Vec<String>>,
+}
+
+fn normalize_category_config(config: CategoryConfig) -> Result<NormalizedCategoryConfig, CliError> {
     let mut extension_owner = HashMap::new();
-    let mut canonical = BTreeMap::new();
+    let mut canonical_categories = BTreeMap::new();
 
     for (category, extensions) in config.categories {
         let category = category.trim().to_string();
@@ -341,10 +746,42 @@ fn normalize_category_config(
             }
         }
 
-        canonical.insert(category, normalized_extensions);
+        canonical_categories.insert(category, normalized_extensions);
     }
 
-    Ok(canonical)
+    let mut path_owner = HashMap::new();
+    let mut canonical_path_rules = BTreeMap::new();
+    for (category, fragments) in config.path_rules.unwrap_or_else(default_path_rules_config) {
+        let category = category.trim().to_string();
+        if category.is_empty() {
+            return Err(CliError::Message(
+                "category config contains an empty path rule category name".to_string(),
+            ));
+        }
+
+        let mut normalized_fragments = fragments
+            .into_iter()
+            .map(|fragment| normalize_path_fragment(&fragment))
+            .filter(|fragment| !fragment.is_empty())
+            .collect::<Vec<_>>();
+        normalized_fragments.sort();
+        normalized_fragments.dedup();
+
+        for fragment in &normalized_fragments {
+            if let Some(previous) = path_owner.insert(fragment.clone(), category.clone()) {
+                return Err(CliError::Message(format!(
+                    "category config assigns path rule {fragment:?} to both {previous} and {category}"
+                )));
+            }
+        }
+
+        canonical_path_rules.insert(category, normalized_fragments);
+    }
+
+    Ok(NormalizedCategoryConfig {
+        categories: canonical_categories,
+        path_rules: canonical_path_rules,
+    })
 }
 
 fn normalize_extension(extension: &str) -> String {
@@ -354,7 +791,18 @@ fn normalize_extension(extension: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn category_fingerprint(canonical: &BTreeMap<String, Vec<String>>) -> String {
+fn normalize_path_fragment(fragment: &str) -> String {
+    fragment
+        .trim()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_ascii_lowercase()
+}
+
+fn category_fingerprint(canonical: &NormalizedCategoryConfig) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     fn feed(hash: &mut u64, bytes: &[u8]) {
         for byte in bytes {
@@ -363,12 +811,22 @@ fn category_fingerprint(canonical: &BTreeMap<String, Vec<String>>) -> String {
         }
     }
 
-    feed(&mut hash, b"dscan11-category-rules-v1\n");
-    for (category, extensions) in canonical {
+    feed(&mut hash, b"dscan11-category-rules-v2\nextensions\n");
+    for (category, extensions) in &canonical.categories {
         feed(&mut hash, category.as_bytes());
         feed(&mut hash, b"\0");
         for extension in extensions {
             feed(&mut hash, extension.as_bytes());
+            feed(&mut hash, b"\0");
+        }
+        feed(&mut hash, b"\n");
+    }
+    feed(&mut hash, b"path-rules\n");
+    for (category, fragments) in &canonical.path_rules {
+        feed(&mut hash, category.as_bytes());
+        feed(&mut hash, b"\0");
+        for fragment in fragments {
+            feed(&mut hash, fragment.as_bytes());
             feed(&mut hash, b"\0");
         }
         feed(&mut hash, b"\n");
@@ -420,6 +878,47 @@ fn default_category_rules() -> [(&'static str, &'static [&'static str]); 9] {
             ],
         ),
         ("Temporary / Cache", &["tmp", "temp", "log", "bak", "dmp"]),
+    ]
+}
+
+fn default_path_rules_config() -> BTreeMap<String, Vec<String>> {
+    let mut path_rules = BTreeMap::new();
+    for (name, fragments) in default_path_rules() {
+        path_rules.insert(
+            name.to_string(),
+            fragments
+                .iter()
+                .map(|fragment| fragment.to_string())
+                .collect(),
+        );
+    }
+    path_rules
+}
+
+fn default_path_rules() -> [(&'static str, &'static [&'static str]); 2] {
+    [
+        (
+            "AI Models",
+            &[
+                ".ollama/models",
+                ".cache/huggingface/hub",
+                "huggingface/hub/models--",
+                "LM Studio/models",
+                "GPT4All",
+            ],
+        ),
+        (
+            "Docker / Containers",
+            &[
+                "AppData/Local/Docker/wsl",
+                "AppData/Local/Docker Desktop",
+                "ProgramData/Docker",
+                "ProgramData/docker/windowsfilter",
+                "ProgramData/docker/containers",
+                "ProgramData/docker/volumes",
+                ".docker",
+            ],
+        ),
     ]
 }
 
@@ -1725,16 +2224,23 @@ pub fn open_cached_path(
     one_based_index: usize,
     limit: usize,
 ) -> Result<(), CliError> {
-    let navigation = match resolve_navigation_path(snapshot, target, one_based_index, limit) {
+    let entry = cached_navigation_entry(snapshot, target, one_based_index, limit)?;
+    let navigation = match navigation_for_entry(&entry, target) {
         Ok(navigation) => navigation,
         Err(err) => {
             println!("{err}");
-            match offer_prune_missing_index(paths, snapshot, target, one_based_index, limit)? {
+            match offer_prune_missing_entry(paths, snapshot, target, &entry)? {
                 PruneOfferResult::Removed | PruneOfferResult::HandledNoChange => return Ok(()),
                 PruneOfferResult::NotOffered => return Err(err),
             }
         }
     };
+    if matches!(
+        offer_prune_missing_entry(paths, snapshot, target, &entry)?,
+        PruneOfferResult::Removed
+    ) {
+        return Ok(());
+    }
     launch_file_explorer(&navigation)?;
     println!("{}", navigation.message);
     Ok(())
@@ -1816,7 +2322,8 @@ fn browse_folders(
         std::process::exit(0);
     }
     let index = parse_one_based_index(&choice, snapshot.largest_folders.len().min(limit))?;
-    let folder = snapshot.largest_folders[index].path.clone();
+    let folder_entry = snapshot.largest_folders[index].clone();
+    let folder = folder_entry.path.clone();
     let files = snapshot
         .largest_files
         .iter()
@@ -1831,6 +2338,9 @@ fn browse_folders(
         .take(limit)
         .cloned()
         .collect::<Vec<_>>();
+    if cached_drilldown_entries_are_empty(&files, &folders) {
+        return offer_open_empty_drilldown_folder(paths, snapshot, &folder_entry);
+    }
     browse_entry_lists(
         paths,
         snapshot,
@@ -1839,6 +2349,46 @@ fn browse_folders(
         &folders,
         limit,
     )
+}
+
+fn cached_drilldown_entries_are_empty(files: &[SizedEntry], folders: &[SizedEntry]) -> bool {
+    files.is_empty() && folders.is_empty()
+}
+
+fn offer_open_empty_drilldown_folder(
+    paths: &CachePaths,
+    snapshot: &mut Snapshot,
+    folder_entry: &SizedEntry,
+) -> Result<(), CliError> {
+    println!("No cached entries under this folder.");
+    println!(
+        "This can happen when the folder is large but its individual files are below the retained top-N list."
+    );
+
+    let navigation = match navigation_for_entry(folder_entry, NavigationTarget::Folder) {
+        Ok(navigation) => navigation,
+        Err(err) => {
+            println!("{err}");
+            match offer_prune_missing_entry(
+                paths,
+                snapshot,
+                NavigationTarget::Folder,
+                folder_entry,
+            )? {
+                PruneOfferResult::Removed | PruneOfferResult::HandledNoChange => return Ok(()),
+                PruneOfferResult::NotOffered => return Err(err),
+            }
+        }
+    };
+
+    print!("Open this folder in Explorer? [y/N]: ");
+    flush_stdout()?;
+    let choice = read_line_trimmed()?.to_ascii_lowercase();
+    if choice == "y" || choice == "yes" {
+        launch_file_explorer(&navigation)?;
+        println!("{}", navigation.message);
+    }
+    Ok(())
 }
 
 fn browse_categories(
@@ -2051,6 +2601,12 @@ fn browse_entry_details(
                         }
                     }
                 };
+                if matches!(
+                    offer_prune_missing_entry(paths, snapshot, target, entry)?,
+                    PruneOfferResult::Removed
+                ) {
+                    return Ok(true);
+                }
                 launch_file_explorer(&navigation)?;
                 println!("{}", navigation.message);
             }
@@ -2174,12 +2730,23 @@ struct NavigationPath {
     message: String,
 }
 
+#[cfg(test)]
 fn resolve_navigation_path(
     snapshot: &Snapshot,
     target: NavigationTarget,
     one_based_index: usize,
     limit: usize,
 ) -> Result<NavigationPath, CliError> {
+    let entry = cached_navigation_entry(snapshot, target, one_based_index, limit)?;
+    navigation_for_entry(&entry, target)
+}
+
+fn cached_navigation_entry(
+    snapshot: &Snapshot,
+    target: NavigationTarget,
+    one_based_index: usize,
+    limit: usize,
+) -> Result<SizedEntry, CliError> {
     match target {
         NavigationTarget::File => {
             let index = checked_one_based_index(
@@ -2187,7 +2754,7 @@ fn resolve_navigation_path(
                 snapshot.largest_files.len().min(limit),
                 "file",
             )?;
-            navigation_for_entry(&snapshot.largest_files[index], NavigationTarget::File)
+            Ok(snapshot.largest_files[index].clone())
         }
         NavigationTarget::Folder => {
             let index = checked_one_based_index(
@@ -2195,7 +2762,7 @@ fn resolve_navigation_path(
                 snapshot.largest_folders.len().min(limit),
                 "folder",
             )?;
-            navigation_for_entry(&snapshot.largest_folders[index], NavigationTarget::Folder)
+            Ok(snapshot.largest_folders[index].clone())
         }
     }
 }
@@ -2253,34 +2820,6 @@ fn navigation_for_entry(
     }
 }
 
-fn offer_prune_missing_index(
-    paths: &CachePaths,
-    snapshot: &mut Snapshot,
-    target: NavigationTarget,
-    one_based_index: usize,
-    limit: usize,
-) -> Result<PruneOfferResult, CliError> {
-    let entry = match target {
-        NavigationTarget::File => {
-            let index = checked_one_based_index(
-                one_based_index,
-                snapshot.largest_files.len().min(limit),
-                "file",
-            )?;
-            snapshot.largest_files[index].clone()
-        }
-        NavigationTarget::Folder => {
-            let index = checked_one_based_index(
-                one_based_index,
-                snapshot.largest_folders.len().min(limit),
-                "folder",
-            )?;
-            snapshot.largest_folders[index].clone()
-        }
-    };
-    offer_prune_missing_entry(paths, snapshot, target, &entry)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PruneOfferResult {
     NotOffered,
@@ -2294,11 +2833,18 @@ fn offer_prune_missing_entry(
     target: NavigationTarget,
     entry: &SizedEntry,
 ) -> Result<PruneOfferResult, CliError> {
-    if !io::stdin().is_terminal() || cached_entry_exists(entry, target) {
+    if !io::stdin().is_terminal() || !entry_is_missing(entry, target) {
         return Ok(PruneOfferResult::NotOffered);
     }
 
     println!();
+    println!(
+        "Missing cached {} detected.",
+        match target {
+            NavigationTarget::File => "file",
+            NavigationTarget::Folder => "folder",
+        }
+    );
     println!("Warning: this only edits the saved dscan11 snapshot.");
     println!("It does not delete anything from disk and it does not rescan the drive.");
     if matches!(target, NavigationTarget::Folder) {
@@ -2343,6 +2889,10 @@ fn cached_entry_exists(entry: &SizedEntry, target: NavigationTarget) -> bool {
         NavigationTarget::File => Path::new(&entry.path).is_file(),
         NavigationTarget::Folder => Path::new(&entry.path).is_dir(),
     }
+}
+
+fn entry_is_missing(entry: &SizedEntry, target: NavigationTarget) -> bool {
+    !cached_entry_exists(entry, target)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2473,15 +3023,21 @@ fn checked_one_based_index(
 #[cfg(windows)]
 fn launch_file_explorer(navigation: &NavigationPath) -> Result<(), CliError> {
     let mut command = Command::new("explorer.exe");
-    if navigation.select_file {
-        command.arg(format!("/select,{}", navigation.path.display()));
-    } else {
-        command.arg(&navigation.path);
+    for arg in explorer_args_for_navigation(navigation) {
+        command.arg(arg);
     }
     command.spawn().map(|_| ()).map_err(|source| CliError::Io {
         context: "failed to open Explorer".to_string(),
         source,
     })
+}
+
+fn explorer_args_for_navigation(navigation: &NavigationPath) -> Vec<String> {
+    if navigation.select_file {
+        vec![format!("/select,\"{}\"", navigation.path.display())]
+    } else {
+        vec![format!("/e,\"{}\"", navigation.path.display())]
+    }
 }
 
 #[cfg(not(windows))]
@@ -2545,6 +3101,7 @@ pub fn print_status(
         scanned_at_utc: String,
         stale_at_utc: Option<String>,
         stale: StaleInfo,
+        workspace: String,
         cache_mode: CacheMode,
         roots: &'a [String],
         cache_dir: String,
@@ -2582,6 +3139,7 @@ pub fn print_status(
         scanned_at_utc,
         stale_at_utc,
         stale: snapshot.stale_info(config.stale_days),
+        workspace: paths.workspace_name.clone(),
         cache_mode: cache_mode(paths, snapshot),
         roots: &snapshot.roots,
         cache_dir: paths.base_dir.display().to_string(),
@@ -2631,6 +3189,7 @@ pub fn print_status(
         );
 
         println!("Cache");
+        println!("  workspace: {}", status.workspace);
         println!(
             "  cache mode: {}",
             match status.cache_mode {
@@ -2773,7 +3332,7 @@ pub fn print_config(
     }
 }
 
-pub fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
+pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), CliError> {
     let json = serde_json::to_string_pretty(value).map_err(|source| CliError::Json {
         context: "failed to serialize JSON output".to_string(),
         source,
@@ -3035,6 +3594,18 @@ mod tests {
             classify_path(Path::new(r"C:\work\project\target\debug\a.obj")),
             "Developer / Code"
         );
+        assert_eq!(
+            classify_path(Path::new(
+                r"C:\Users\Example\.ollama\models\blobs\sha256-acaad28d51b81c74"
+            )),
+            "AI Models"
+        );
+        assert_eq!(
+            classify_path(Path::new(
+                r"C:\Users\Example\AppData\Local\Docker\wsl\data\ext4.vhdx"
+            )),
+            "Docker / Containers"
+        );
     }
 
     #[test]
@@ -3048,11 +3619,56 @@ mod tests {
             r"C:\x\disk.vhdx",
             r"C:\Users\Example\OneDrive\thing.bin",
             r"C:\work\project\target\debug\a.obj",
+            r"C:\Users\Example\.ollama\models\blobs\sha256-acaad28d51b81c74",
+            r"C:\Users\Example\AppData\Local\Docker\wsl\data\ext4.vhdx",
         ] {
             assert_eq!(
                 rules.classify(Path::new(path)),
                 classify_path(Path::new(path))
             );
+        }
+    }
+
+    #[test]
+    fn path_rules_take_priority_over_extensions_and_cloud_fallback() {
+        assert_eq!(
+            classify_path(Path::new(
+                r"C:\Users\Example\AppData\Local\Docker\wsl\data\ext4.vhdx"
+            )),
+            "Docker / Containers"
+        );
+        assert_eq!(
+            classify_path(Path::new(r"C:\Users\Example\.ollama\models\weights.pdf")),
+            "AI Models"
+        );
+        assert_eq!(
+            classify_path(Path::new(r"C:\Users\Example\OneDrive\notes.pdf")),
+            "Documents"
+        );
+        assert_eq!(
+            classify_path(Path::new(r"C:\Users\Example\OneDrive\thing.unknown")),
+            "Cloud / OneDrive"
+        );
+    }
+
+    #[test]
+    fn classifies_common_ai_model_and_docker_storage_paths() {
+        for path in [
+            r"C:\Users\Example\.cache\huggingface\hub\models--org--model\blobs\abc",
+            r"C:\Users\Example\huggingface\hub\models--org--model\blobs\abc",
+            r"C:\Users\Example\AppData\Local\LM Studio\models\publisher\model.gguf",
+            r"C:\Users\Example\AppData\Local\GPT4All\model.gguf",
+        ] {
+            assert_eq!(classify_path(Path::new(path)), "AI Models");
+        }
+
+        for path in [
+            r"C:\ProgramData\docker\windowsfilter\layer\file",
+            r"C:\ProgramData\docker\containers\id\config.v2.json",
+            r"C:\ProgramData\docker\volumes\volume\_data\blob",
+            r"C:\Users\Example\.docker\desktop\vm-data\DockerDesktop.vhdx",
+        ] {
+            assert_eq!(classify_path(Path::new(path)), "Docker / Containers");
         }
     }
 
@@ -3069,12 +3685,22 @@ mod tests {
             vec!["pdf".to_string(), "txt".to_string()],
         );
 
-        let first =
-            CategoryRules::from_config(CategoryConfig { categories: first }, "test".to_string())
-                .expect("first rules");
-        let second =
-            CategoryRules::from_config(CategoryConfig { categories: second }, "test".to_string())
-                .expect("second rules");
+        let first = CategoryRules::from_config(
+            CategoryConfig {
+                categories: first,
+                path_rules: None,
+            },
+            "test".to_string(),
+        )
+        .expect("first rules");
+        let second = CategoryRules::from_config(
+            CategoryConfig {
+                categories: second,
+                path_rules: None,
+            },
+            "test".to_string(),
+        )
+        .expect("second rules");
 
         assert_eq!(first.fingerprint(), second.fingerprint());
     }
@@ -3086,14 +3712,69 @@ mod tests {
         let mut second = BTreeMap::new();
         second.insert("Archives".to_string(), vec!["pdf".to_string()]);
 
-        let first =
-            CategoryRules::from_config(CategoryConfig { categories: first }, "test".to_string())
-                .expect("first rules");
-        let second =
-            CategoryRules::from_config(CategoryConfig { categories: second }, "test".to_string())
-                .expect("second rules");
+        let first = CategoryRules::from_config(
+            CategoryConfig {
+                categories: first,
+                path_rules: None,
+            },
+            "test".to_string(),
+        )
+        .expect("first rules");
+        let second = CategoryRules::from_config(
+            CategoryConfig {
+                categories: second,
+                path_rules: None,
+            },
+            "test".to_string(),
+        )
+        .expect("second rules");
 
         assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn category_fingerprint_changes_when_path_rules_change() {
+        let mut first_path_rules = BTreeMap::new();
+        first_path_rules.insert("AI Models".to_string(), vec![".ollama/models".to_string()]);
+        let mut second_path_rules = BTreeMap::new();
+        second_path_rules.insert(
+            "Docker / Containers".to_string(),
+            vec![".ollama/models".to_string()],
+        );
+
+        let first = CategoryRules::from_config(
+            CategoryConfig {
+                categories: BTreeMap::new(),
+                path_rules: Some(first_path_rules),
+            },
+            "test".to_string(),
+        )
+        .expect("first rules");
+        let second = CategoryRules::from_config(
+            CategoryConfig {
+                categories: BTreeMap::new(),
+                path_rules: Some(second_path_rules),
+            },
+            "test".to_string(),
+        )
+        .expect("second rules");
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn old_style_category_config_without_path_rules_still_loads() {
+        let config: CategoryConfig =
+            serde_json::from_str(r#"{"categories":{"Documents":["pdf"]}}"#)
+                .expect("old category config parses");
+        let rules = CategoryRules::from_config(config, "test".to_string()).expect("rules");
+
+        assert_eq!(
+            rules.classify(Path::new(
+                r"C:\Users\Example\.ollama\models\blobs\sha256-abc",
+            )),
+            "AI Models"
+        );
     }
 
     #[test]
@@ -3191,6 +3872,25 @@ mod tests {
             Some("fnv1a64:test")
         );
         assert_eq!(loaded.scan_stats.elapsed_ms, 123);
+    }
+
+    #[test]
+    fn workspace_name_validator_accepts_portable_names() {
+        for name in ["default", "media-2026", "work.docs", "backup_1"] {
+            validate_workspace_name(name).expect("valid workspace name");
+        }
+    }
+
+    #[test]
+    fn workspace_name_validator_rejects_unsafe_names_with_hint() {
+        for name in ["", ".", "..", "media/photos", "bad name", "oops!"] {
+            let err = validate_workspace_name(name).expect_err("invalid workspace name");
+            let message = err.to_string();
+            assert!(
+                message.contains("invalid workspace name"),
+                "unexpected error for {name:?}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -3322,6 +4022,124 @@ mod tests {
             err.to_string()
                 .contains("file number must be between 1 and 1")
         );
+    }
+
+    #[test]
+    fn missing_cached_file_with_existing_parent_navigates_to_parent() {
+        let dir = temp_dir("missing_file_parent_navigation");
+        let parent = dir.join("folder with spaces");
+        fs::create_dir(&parent).expect("mkdir");
+        let missing_file = parent.join("gone file.tmp");
+        let entry = SizedEntry {
+            path: missing_file.display().to_string(),
+            bytes: 948,
+            allocated_bytes: 948,
+            files: None,
+            category: Some("Temporary / Cache".to_string()),
+        };
+
+        let navigation = navigation_for_entry(&entry, NavigationTarget::File).expect("navigation");
+
+        assert_eq!(navigation.path, parent);
+        assert!(!navigation.select_file);
+        assert!(navigation.message.contains("cached file was not found"));
+    }
+
+    #[test]
+    fn missing_cached_file_is_prune_eligible_even_when_parent_exists() {
+        let dir = temp_dir("missing_file_prune_eligible");
+        let parent = dir.join("cache");
+        fs::create_dir(&parent).expect("mkdir");
+        let entry = SizedEntry {
+            path: parent.join("gone.bin").display().to_string(),
+            bytes: 100,
+            allocated_bytes: 200,
+            files: None,
+            category: Some("Other".to_string()),
+        };
+
+        assert!(entry_is_missing(&entry, NavigationTarget::File));
+        assert!(navigation_for_entry(&entry, NavigationTarget::File).is_ok());
+    }
+
+    #[test]
+    fn explorer_args_quote_spacey_paths_for_folder_and_select_modes() {
+        let folder_navigation = NavigationPath {
+            path: PathBuf::from(r"C:\Users\Example\Folder With Spaces"),
+            select_file: false,
+            message: String::new(),
+        };
+        assert_eq!(
+            explorer_args_for_navigation(&folder_navigation),
+            vec![r#"/e,"C:\Users\Example\Folder With Spaces""#.to_string()]
+        );
+
+        let file_navigation = NavigationPath {
+            path: PathBuf::from(r"C:\Users\Example\Folder With Spaces\file.bin"),
+            select_file: true,
+            message: String::new(),
+        };
+        assert_eq!(
+            explorer_args_for_navigation(&file_navigation),
+            vec![r#"/select,"C:\Users\Example\Folder With Spaces\file.bin""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn detects_empty_cached_folder_drilldown_lists() {
+        let file_entry = sized_entry(r"C:\cache-test\child.bin", 100, 100);
+        let folder_entry = SizedEntry {
+            path: r"C:\cache-test\child".to_string(),
+            bytes: 100,
+            allocated_bytes: 100,
+            files: Some(1),
+            category: None,
+        };
+
+        assert!(cached_drilldown_entries_are_empty(&[], &[]));
+        assert!(!cached_drilldown_entries_are_empty(
+            std::slice::from_ref(&file_entry),
+            &[]
+        ));
+        assert!(!cached_drilldown_entries_are_empty(
+            &[],
+            std::slice::from_ref(&folder_entry)
+        ));
+    }
+
+    #[test]
+    fn existing_cached_folder_builds_folder_open_navigation() {
+        let dir = temp_dir("existing_folder_open_navigation");
+        let entry = SizedEntry {
+            path: dir.display().to_string(),
+            bytes: 100,
+            allocated_bytes: 100,
+            files: Some(10),
+            category: None,
+        };
+
+        let navigation =
+            navigation_for_entry(&entry, NavigationTarget::Folder).expect("folder navigation");
+
+        assert_eq!(navigation.path, dir);
+        assert!(!navigation.select_file);
+        assert!(navigation.message.contains("Opening Explorer at"));
+    }
+
+    #[test]
+    fn missing_selected_folder_is_prune_eligible() {
+        let dir = temp_dir("missing_folder_prune_eligible");
+        let missing = dir.join("gone");
+        let entry = SizedEntry {
+            path: missing.display().to_string(),
+            bytes: 100,
+            allocated_bytes: 100,
+            files: Some(4),
+            category: None,
+        };
+
+        assert!(entry_is_missing(&entry, NavigationTarget::Folder));
+        assert!(navigation_for_entry(&entry, NavigationTarget::Folder).is_err());
     }
 
     #[test]
@@ -3541,7 +4359,11 @@ mod tests {
 
     fn test_cache_paths(dir: &Path) -> CachePaths {
         CachePaths {
+            app_dir: dir.to_path_buf(),
             base_dir: dir.to_path_buf(),
+            workspaces_dir: dir.join("workspaces"),
+            workspace_registry_path: dir.join("workspaces.json"),
+            workspace_name: DEFAULT_WORKSPACE_NAME.to_string(),
             config_path: dir.join("config.json"),
             category_config_path: dir.join("categories.json"),
             snapshot_path: dir.join("snapshot.json"),
