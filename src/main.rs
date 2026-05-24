@@ -108,6 +108,7 @@ fn run() -> Result<(), CliError> {
                             stale.age_days, stale.stale_after_days
                         );
                         if output.is_json() || !io::stdin().is_terminal() {
+                            record_cache_usage(&paths, CacheUsageEventKind::ScanAutoSkip)?;
                             print_status(
                                 &snapshot,
                                 &paths,
@@ -115,10 +116,10 @@ fn run() -> Result<(), CliError> {
                                 Some(&category_rules),
                                 output,
                             )?;
-                            record_cache_usage(&paths, CacheUsageEventKind::ScanAutoSkip)?;
                             return Ok(());
                         }
                         if !confirm_rescan()? {
+                            record_cache_usage(&paths, CacheUsageEventKind::ScanAutoSkip)?;
                             print_status(
                                 &snapshot,
                                 &paths,
@@ -126,7 +127,6 @@ fn run() -> Result<(), CliError> {
                                 Some(&category_rules),
                                 output,
                             )?;
-                            record_cache_usage(&paths, CacheUsageEventKind::ScanAutoSkip)?;
                             return Ok(());
                         }
                     }

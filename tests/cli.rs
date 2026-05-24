@@ -217,6 +217,10 @@ fn fresh_scan_without_force_uses_cached_status_in_noninteractive_mode() {
         stdout.contains("Scan status"),
         "fresh scan should show previous cached status:\n{stdout}"
     );
+    assert!(
+        stdout.contains("avoided readouts: 1"),
+        "fresh scan should include its own cache savings:\n{stdout}"
+    );
     assert_file_bytes(&cache, 1_024);
 
     let mut forced_scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
