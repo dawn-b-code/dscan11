@@ -47,4 +47,6 @@ $parts = @($InstallDir) + $parts
 
 Write-Host "Installed $installExe"
 Write-Host "Updated User PATH so $InstallDir is the dscan11 location."
-Write-Host "Open a new PowerShell window, then run: where.exe dscan11.exe"
+Write-Host "Open a new PowerShell window, then run: where.exe dscan11"
+Write-Host "Try it with: dscan11 --version"
+Write-Host "Then use commands like: dscan11 status"

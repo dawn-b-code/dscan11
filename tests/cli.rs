@@ -3,6 +3,33 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn version_flags_print_package_version_without_touching_cache() {
+    for flag in ["--version", "-V"] {
+        let cache = temp_dir("version-cache");
+        let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+            .env("LOCALAPPDATA", &cache)
+            .arg(flag)
+            .output()
+            .expect("run version");
+
+        assert!(
+            output.status.success(),
+            "version failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "dscan11 0.10.0"
+        );
+        assert!(
+            !cache.join("dscan11").exists(),
+            "{flag} should not initialize cache state"
+        );
+    }
+}
+
+#[test]
 fn cli_scan_and_cached_views_work_on_temp_tree() {
     let cache = temp_dir("cache");
     let tree = temp_dir("tree");
@@ -52,7 +79,7 @@ fn cli_scan_and_cached_views_work_on_temp_tree() {
         "Manual cleanups",
         "Cache savings",
         "Category rules",
-        "Performance",
+        "Initial Scan Performance",
     ] {
         assert!(
             stdout.contains(header),
@@ -76,6 +103,8 @@ fn status_reports_cache_tracking_and_savings_without_counting_status() {
     assert_success(summary, "Disk Images / VMs");
 
     let first_status = status_json(&cache);
+    assert_eq!(first_status["app_version"].as_str(), Some("0.10.0"));
+    assert_eq!(first_status["snapshot_schema_version"].as_u64(), Some(3));
     assert_eq!(first_status["cache_mode"].as_str(), Some("base_scan"));
     assert!(
         first_status["scanned_at_utc"]
@@ -281,6 +310,7 @@ fn config_init_categories_creates_default_category_config() {
     let contents = std::fs::read_to_string(&category_path).expect("read categories");
     let categories: serde_json::Value =
         serde_json::from_str(&contents).expect("categories are valid JSON");
+    assert_eq!(categories["version"].as_u64(), Some(1));
     assert_eq!(
         categories["categories"]["Videos"]
             .as_array()
@@ -312,6 +342,139 @@ fn config_init_categories_creates_default_category_config() {
             .iter()
             .any(|value| value == "ProgramData/docker/containers"),
         true
+    );
+}
+
+#[test]
+fn companion_files_are_versioned_and_legacy_files_still_load() {
+    let cache = temp_dir("schema-cache");
+    let app = cache.join("dscan11");
+    std::fs::create_dir_all(&app).expect("create app dir");
+    std::fs::write(
+        app.join("config.json"),
+        r#"{"stale_days":7,"top_limit":50,"skip_names":["Windows"]}"#,
+    )
+    .expect("write legacy config");
+    std::fs::write(
+        app.join("categories.json"),
+        r#"{"categories":{"Custom":["abc"]}}"#,
+    )
+    .expect("write legacy categories");
+
+    let mut config = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    config
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("config");
+    let output = config.output().expect("run config");
+    assert!(
+        output.status.success(),
+        "legacy config failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config_json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config emits JSON");
+    assert_eq!(config_json["config_version"].as_u64(), Some(1));
+    assert_eq!(config_json["category_config_version"].as_u64(), Some(1));
+    assert_eq!(config_json["workspace_registry_version"].as_u64(), Some(1));
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(app.join("workspaces.json")).expect("read registry"),
+    )
+    .expect("registry json");
+    assert_eq!(registry["version"].as_u64(), Some(1));
+
+    let mut save_config = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    save_config
+        .env("LOCALAPPDATA", &cache)
+        .arg("config")
+        .arg("--stale-days")
+        .arg("8");
+    assert_success(save_config, "Config");
+    let saved_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(app.join("config.json")).expect("read saved config"),
+    )
+    .expect("config json");
+    assert_eq!(saved_config["version"].as_u64(), Some(1));
+
+    std::fs::remove_file(app.join("categories.json")).expect("remove legacy categories");
+    let mut init_categories = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    init_categories
+        .env("LOCALAPPDATA", &cache)
+        .arg("config")
+        .arg("--init-categories");
+    assert_success(init_categories, "Created category config from defaults");
+    let saved_categories: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(app.join("categories.json")).expect("read saved categories"),
+    )
+    .expect("categories json");
+    assert_eq!(saved_categories["version"].as_u64(), Some(1));
+}
+
+#[test]
+fn unsupported_future_companion_versions_fail_clearly() {
+    let cache = temp_dir("future-schema-cache");
+    let app = cache.join("dscan11");
+    std::fs::create_dir_all(&app).expect("create app dir");
+    std::fs::write(
+        app.join("config.json"),
+        r#"{"version":2,"stale_days":7,"top_limit":50,"skip_names":[]}"#,
+    )
+    .expect("write future config");
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("config")
+        .output()
+        .expect("run future config");
+    assert!(!output.status.success(), "future config should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported config version 2"),
+        "unexpected stderr:\n{stderr}"
+    );
+
+    let cache = temp_dir("future-registry-cache");
+    let app = cache.join("dscan11");
+    std::fs::create_dir_all(&app).expect("create app dir");
+    std::fs::write(
+        app.join("workspaces.json"),
+        r#"{"version":2,"active":"default","workspaces":{"default":{"created_at_unix":1}}}"#,
+    )
+    .expect("write future registry");
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("workspace")
+        .arg("list")
+        .output()
+        .expect("run future registry");
+    assert!(!output.status.success(), "future registry should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported workspace registry version 2"),
+        "unexpected stderr:\n{stderr}"
+    );
+
+    let cache = temp_dir("future-category-cache");
+    let tree = temp_dir("future-category-tree");
+    std::fs::write(tree.join("movie.mkv"), vec![0; 1_024]).expect("write movie");
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache).arg("scan").arg(&tree);
+    assert_success(scan, "Scan status");
+    std::fs::write(
+        cache.join("dscan11").join("categories.json"),
+        r#"{"version":2,"categories":{"Videos":["mkv"]}}"#,
+    )
+    .expect("write future category config");
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("status")
+        .output()
+        .expect("run future category status");
+    assert!(!output.status.success(), "future category should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported category config version 2"),
+        "unexpected stderr:\n{stderr}"
     );
 }
 
@@ -668,6 +831,7 @@ fn help_documents_commands_flags_and_examples() {
     for needle in [
         "Usage:",
         "Global options:",
+        "--version",
         "--workspace NAME",
         "Commands:",
         "scan [--force] [--top N] [paths...]",
@@ -687,6 +851,7 @@ fn help_documents_commands_flags_and_examples() {
         "--top controls how much scan data is stored.",
         "--limit controls how much cached data is displayed.",
         "JSON output respects --limit",
+        "Companion file versions:",
         "Exit codes:",
     ] {
         assert!(
@@ -712,6 +877,10 @@ fn readme_uses_generic_public_paths() {
         "README should not contain personal local paths"
     );
     assert!(readme.contains(r"C:\Users\Example"));
+    assert!(readme.contains("dscan11 --version"));
+    assert!(readme.contains("dscan11 status"));
+    assert!(readme.contains("where.exe dscan11"));
+    assert!(!readme.contains("where.exe dscan11.exe"));
 }
 
 fn personal_path_marker() -> String {

@@ -24,12 +24,14 @@ powershell -ExecutionPolicy Bypass -File scripts\install-local.ps1
 
 This copies the release binary to `%LOCALAPPDATA%\Programs\dscan11\dscan11.exe`
 and keeps the build output directory out of User PATH so Windows does not choose
-between multiple `dscan11.exe` copies.
+between multiple installed copies. Open a new PowerShell window after install,
+then check the command with `where.exe dscan11` and `dscan11 --version`.
 
 ## Usage
 
 ```powershell
 dscan11 --help
+dscan11 --version
 dscan11 scan C:\Users\Example
 dscan11 summary
 dscan11 files
@@ -75,6 +77,12 @@ creating or switching to a workspace dedicated to that scan; scripted and JSON
 runs fail with a clear next step. Existing single-cache installs are adopted into
 workspace `default` automatically.
 
+Local companion files include schema versions so future incompatible state is
+recognized cleanly. Existing unversioned config, category, workspace registry,
+and journal files are treated as legacy v1 and remain readable; newly created or
+rewritten files include their version. If a file was written by a newer
+unsupported dscan11, the command fails with a clear upgrade or refresh message.
+
 Category rules are loaded from `%LOCALAPPDATA%\dscan11\categories.json` only for
 `scan` and `status`. If the file is missing, built-in defaults are used. To
 create an editable file with all defaults already filled in, run:
@@ -107,8 +115,8 @@ model blobs are categorized by storage root first. OneDrive is a lower-priority
 fallback for remaining unmatched files.
 
 After a scan, `status` reports whether category rules have changed since the
-snapshot was written, plus effective average scan rates. These rates describe the
-scanner's average throughput for that run, not raw disk benchmark results.
+snapshot was written, plus initial scan performance rates. These rates describe
+the scanner's average throughput for that run, not raw disk benchmark results.
 Status also reports manual cleanup totals and estimated scan work avoided by
 cache views. The savings estimate treats each counted cache readout as one
 avoided full readout of the latest scanned scope; Explorer `open` navigation is

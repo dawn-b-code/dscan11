@@ -8,10 +8,16 @@ use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-const SNAPSHOT_VERSION: u32 = 3;
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const SNAPSHOT_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 1;
+pub const CATEGORY_CONFIG_VERSION: u32 = 1;
+pub const WORKSPACE_REGISTRY_VERSION: u32 = 1;
+pub const CLEANUP_JOURNAL_VERSION: u32 = 1;
+pub const CACHE_USAGE_JOURNAL_VERSION: u32 = 1;
 const DEFAULT_STALE_DAYS: u64 = 15;
 const DEFAULT_TOP_LIMIT: usize = 1_000;
 const APP_DIR_NAME: &str = "dscan11";
@@ -52,6 +58,86 @@ impl std::fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+fn config_version() -> u32 {
+    CONFIG_VERSION
+}
+
+fn category_config_version() -> u32 {
+    CATEGORY_CONFIG_VERSION
+}
+
+fn workspace_registry_version() -> u32 {
+    WORKSPACE_REGISTRY_VERSION
+}
+
+fn cleanup_journal_version() -> u32 {
+    CLEANUP_JOURNAL_VERSION
+}
+
+fn cache_usage_journal_version() -> u32 {
+    CACHE_USAGE_JOURNAL_VERSION
+}
+
+fn deserialize_config_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_supported_version(deserializer, "config", CONFIG_VERSION)
+}
+
+fn deserialize_category_config_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_supported_version(deserializer, "category config", CATEGORY_CONFIG_VERSION)
+}
+
+fn deserialize_workspace_registry_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_supported_version(
+        deserializer,
+        "workspace registry",
+        WORKSPACE_REGISTRY_VERSION,
+    )
+}
+
+fn deserialize_cleanup_journal_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_supported_version(deserializer, "cleanup journal", CLEANUP_JOURNAL_VERSION)
+}
+
+fn deserialize_cache_usage_journal_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_supported_version(
+        deserializer,
+        "cache usage journal",
+        CACHE_USAGE_JOURNAL_VERSION,
+    )
+}
+
+fn deserialize_supported_version<'de, D>(
+    deserializer: D,
+    label: &str,
+    supported: u32,
+) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version > supported {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported {label} version {version}; this dscan11 supports {supported}"
+        )));
+    }
+    Ok(version)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
@@ -146,6 +232,11 @@ fn workspace_cache_paths(app_dir: &Path, workspace_name: &str) -> Result<CachePa
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRegistry {
+    #[serde(
+        default = "workspace_registry_version",
+        deserialize_with = "deserialize_workspace_registry_version"
+    )]
+    pub version: u32,
     pub active: String,
     pub workspaces: BTreeMap<String, WorkspaceInfo>,
 }
@@ -197,6 +288,7 @@ fn load_or_init_workspace_registry(app_dir: &Path) -> Result<WorkspaceRegistry, 
             let mut workspaces = BTreeMap::new();
             workspaces.insert(DEFAULT_WORKSPACE_NAME.to_string(), WorkspaceInfo::new()?);
             let registry = WorkspaceRegistry {
+                version: WORKSPACE_REGISTRY_VERSION,
                 active: DEFAULT_WORKSPACE_NAME.to_string(),
                 workspaces,
             };
@@ -277,6 +369,7 @@ fn migrate_legacy_cache(app_dir: &Path) -> Result<(), CliError> {
     save_workspace_registry(
         app_dir,
         &WorkspaceRegistry {
+            version: WORKSPACE_REGISTRY_VERSION,
             active: DEFAULT_WORKSPACE_NAME.to_string(),
             workspaces,
         },
@@ -472,6 +565,11 @@ fn workspace_view(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
+    #[serde(
+        default = "config_version",
+        deserialize_with = "deserialize_config_version"
+    )]
+    pub version: u32,
     pub stale_days: u64,
     pub top_limit: usize,
     pub skip_names: Vec<String>,
@@ -480,6 +578,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            version: CONFIG_VERSION,
             stale_days: DEFAULT_STALE_DAYS,
             top_limit: DEFAULT_TOP_LIMIT,
             skip_names: vec![
@@ -535,6 +634,11 @@ pub struct CategoryConfigBootstrap {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CategoryConfig {
+    #[serde(
+        default = "category_config_version",
+        deserialize_with = "deserialize_category_config_version"
+    )]
+    pub version: u32,
     pub categories: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub path_rules: Option<BTreeMap<String, Vec<String>>>,
@@ -615,6 +719,7 @@ impl Default for CategoryConfig {
             );
         }
         Self {
+            version: CATEGORY_CONFIG_VERSION,
             categories,
             path_rules: Some(default_path_rules_config()),
         }
@@ -1003,6 +1108,11 @@ pub struct TimestampedEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CleanupJournalEntry {
+    #[serde(
+        default = "cleanup_journal_version",
+        deserialize_with = "deserialize_cleanup_journal_version"
+    )]
+    pub version: u32,
     pub timestamp: TimestampedEvent,
     pub target_type: String,
     pub path: String,
@@ -1017,6 +1127,11 @@ pub struct CleanupJournalEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheUsageJournalEntry {
+    #[serde(
+        default = "cache_usage_journal_version",
+        deserialize_with = "deserialize_cache_usage_journal_version"
+    )]
+    pub version: u32,
     pub timestamp: TimestampedEvent,
     pub event: CacheUsageEventKind,
     pub counts_as_readout: bool,
@@ -1444,6 +1559,7 @@ pub fn cache_mode(paths: &CachePaths, snapshot: &Snapshot) -> CacheMode {
 pub fn record_cache_usage(paths: &CachePaths, event: CacheUsageEventKind) -> Result<(), CliError> {
     let basis = load_base_snapshot(paths).or_else(|_| load_snapshot(paths))?;
     let entry = CacheUsageJournalEntry {
+        version: CACHE_USAGE_JOURNAL_VERSION,
         timestamp: timestamped_event()?,
         event,
         counts_as_readout: event.counts_as_readout(),
@@ -1464,6 +1580,7 @@ fn append_cleanup_journal(
     result: &PruneResult,
 ) -> Result<(), CliError> {
     let journal_entry = CleanupJournalEntry {
+        version: CLEANUP_JOURNAL_VERSION,
         timestamp: timestamped_event()?,
         target_type: navigation_target_label(target).to_string(),
         path: entry.path.clone(),
@@ -2506,11 +2623,11 @@ fn browse_entry_lists(
 
 fn print_detail_menu_prompt(files_empty: bool, folders_empty: bool) {
     if files_empty {
-        print!("Choose 1=details folders N, 2=back, or q=exit: ");
+        print!("Choose 1=view folder details, 2=back, or q=exit: ");
     } else if folders_empty {
-        print!("Choose 1=details files N, 2=back, or q=exit: ");
+        print!("Choose 1=view file details, 2=back, or q=exit: ");
     } else {
-        print!("Choose 1=details files N, 2=details folders N, 3=back, or q=exit: ");
+        print!("Choose 1=view file details, 2=view folder details, 3=back, or q=exit: ");
     }
 }
 
@@ -2563,7 +2680,7 @@ fn detail_menu_index(parts: &[&str], label: &str) -> Result<usize, CliError> {
             .parse::<usize>()
             .map_err(|_| CliError::Message(format!("{label} number must be a positive integer")));
     }
-    print!("{label} number: ");
+    print!("Which {label} do you want details for? ");
     flush_stdout()?;
     let choice = read_line_trimmed()?;
     choice
@@ -3097,6 +3214,8 @@ pub fn print_status(
 ) -> Result<(), CliError> {
     #[derive(Serialize)]
     struct Status<'a> {
+        app_version: &'static str,
+        snapshot_schema_version: u32,
         scanned_at_unix: u64,
         scanned_at_utc: String,
         stale_at_utc: Option<String>,
@@ -3135,6 +3254,8 @@ pub fn print_status(
         )?)
     };
     let status = Status {
+        app_version: APP_VERSION,
+        snapshot_schema_version: SNAPSHOT_VERSION,
         scanned_at_unix: snapshot.scanned_at_unix,
         scanned_at_utc,
         stale_at_utc,
@@ -3166,6 +3287,9 @@ pub fn print_status(
         print_json(&status)
     } else {
         println!("Scan status");
+        println!("Version");
+        println!("  app: {}", status.app_version);
+        println!("  snapshot schema: {}", status.snapshot_schema_version);
 
         println!("Scan freshness");
         println!("  scanned unix: {}", status.scanned_at_unix);
@@ -3275,7 +3399,7 @@ pub fn print_status(
             println!("  category rules: {message}");
         }
 
-        println!("Performance");
+        println!("Initial Scan Performance");
         println!(
             "  elapsed: {}",
             human_duration(status.scan_stats.elapsed_ms)
@@ -3308,14 +3432,36 @@ pub fn print_config(
 ) -> Result<(), CliError> {
     #[derive(Serialize)]
     struct ConfigView<'a> {
+        app_version: &'static str,
         config_path: String,
         category_config_path: String,
+        workspace_registry_path: String,
+        supported_config_version: u32,
+        supported_category_config_version: u32,
+        supported_workspace_registry_version: u32,
+        config_version: u32,
+        category_config_version: Option<u32>,
+        workspace_registry_version: Option<u32>,
         config: &'a AppConfig,
     }
 
     let view = ConfigView {
+        app_version: APP_VERSION,
         config_path: paths.config_path.display().to_string(),
         category_config_path: paths.category_config_path.display().to_string(),
+        workspace_registry_path: paths.workspace_registry_path.display().to_string(),
+        supported_config_version: CONFIG_VERSION,
+        supported_category_config_version: CATEGORY_CONFIG_VERSION,
+        supported_workspace_registry_version: WORKSPACE_REGISTRY_VERSION,
+        config_version: config.version,
+        category_config_version: read_json_version(
+            &paths.category_config_path,
+            CATEGORY_CONFIG_VERSION,
+        )?,
+        workspace_registry_version: read_json_version(
+            &paths.workspace_registry_path,
+            WORKSPACE_REGISTRY_VERSION,
+        )?,
         config,
     };
 
@@ -3323,13 +3469,51 @@ pub fn print_config(
         print_json(&view)
     } else {
         println!("Config");
+        println!("  app version: {}", view.app_version);
         println!("  path: {}", view.config_path);
         println!("  category config: {}", view.category_config_path);
+        println!("  workspace registry: {}", view.workspace_registry_path);
+        println!("  config schema: {}", view.config_version);
+        println!(
+            "  category config schema: {}",
+            view.category_config_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "missing".to_string())
+        );
+        println!(
+            "  workspace registry schema: {}",
+            view.workspace_registry_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "missing".to_string())
+        );
         println!("  stale days: {}", config.stale_days);
         println!("  top limit: {}", config.top_limit);
         println!("  skip names: {}", config.skip_names.join(", "));
         Ok(())
     }
+}
+
+fn read_json_version(path: &Path, legacy_version: u32) -> Result<Option<u32>, CliError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CliError::Io {
+                context: format!("failed to read {}", path.display()),
+                source,
+            });
+        }
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or(legacy_version),
+    ))
 }
 
 pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), CliError> {
@@ -3687,6 +3871,7 @@ mod tests {
 
         let first = CategoryRules::from_config(
             CategoryConfig {
+                version: CATEGORY_CONFIG_VERSION,
                 categories: first,
                 path_rules: None,
             },
@@ -3695,6 +3880,7 @@ mod tests {
         .expect("first rules");
         let second = CategoryRules::from_config(
             CategoryConfig {
+                version: CATEGORY_CONFIG_VERSION,
                 categories: second,
                 path_rules: None,
             },
@@ -3714,6 +3900,7 @@ mod tests {
 
         let first = CategoryRules::from_config(
             CategoryConfig {
+                version: CATEGORY_CONFIG_VERSION,
                 categories: first,
                 path_rules: None,
             },
@@ -3722,6 +3909,7 @@ mod tests {
         .expect("first rules");
         let second = CategoryRules::from_config(
             CategoryConfig {
+                version: CATEGORY_CONFIG_VERSION,
                 categories: second,
                 path_rules: None,
             },
@@ -3744,6 +3932,7 @@ mod tests {
 
         let first = CategoryRules::from_config(
             CategoryConfig {
+                version: CATEGORY_CONFIG_VERSION,
                 categories: BTreeMap::new(),
                 path_rules: Some(first_path_rules),
             },
@@ -3752,6 +3941,7 @@ mod tests {
         .expect("first rules");
         let second = CategoryRules::from_config(
             CategoryConfig {
+                version: CATEGORY_CONFIG_VERSION,
                 categories: BTreeMap::new(),
                 path_rules: Some(second_path_rules),
             },
@@ -4224,6 +4414,10 @@ mod tests {
 
         append_cleanup_journal(&paths, NavigationTarget::File, &entry, &result)
             .expect("append cleanup");
+        let line = fs::read_to_string(&paths.cleanup_journal_path).expect("read cleanup journal");
+        let entry_json: serde_json::Value =
+            serde_json::from_str(line.trim()).expect("cleanup journal JSON");
+        assert_eq!(entry_json["version"].as_u64(), Some(1));
 
         let totals = manual_cleanup_totals(&paths).expect("cleanup totals");
         assert_eq!(totals.events, 1);
@@ -4327,6 +4521,15 @@ mod tests {
         record_cache_usage(&paths, CacheUsageEventKind::Summary).expect("record summary");
         record_cache_usage(&paths, CacheUsageEventKind::CacheNavigation)
             .expect("record navigation");
+        let first_line = fs::read_to_string(&paths.cache_usage_journal_path)
+            .expect("read cache usage journal")
+            .lines()
+            .next()
+            .expect("first cache usage line")
+            .to_string();
+        let entry_json: serde_json::Value =
+            serde_json::from_str(&first_line).expect("cache usage journal JSON");
+        assert_eq!(entry_json["version"].as_u64(), Some(1));
 
         let totals = cache_savings_totals(&paths).expect("savings totals");
         assert_eq!(totals.counted_readouts, 1);
@@ -4334,6 +4537,53 @@ mod tests {
         assert_eq!(totals.estimated_allocated_bytes_not_rewalked, 2_000);
         assert_eq!(totals.estimated_files_not_rechecked, 10);
         assert_eq!(totals.estimated_scan_time_saved_ms, 500);
+    }
+
+    #[test]
+    fn unversioned_and_future_journal_entries_are_handled_explicitly() {
+        let dir = temp_dir("journal_versions");
+        let paths = test_cache_paths(&dir);
+        fs::write(
+            &paths.cleanup_journal_path,
+            r#"{"timestamp":{"unix_seconds":1,"utc":"1970-01-01T00:00:01Z"},"target_type":"file","path":"old.bin","removed_files":1,"removed_folders":0,"bytes":10,"allocated_bytes":20,"human_size":"10 B","human_on_disk":"20 B","entry":{"path":"old.bin","bytes":10,"allocated_bytes":20,"files":null,"category":"Other"}}"#,
+        )
+        .expect("write legacy cleanup journal");
+        assert_eq!(
+            load_cleanup_journal(&paths).expect("legacy cleanup loads")[0].version,
+            CLEANUP_JOURNAL_VERSION
+        );
+
+        fs::write(
+            &paths.cache_usage_journal_path,
+            r#"{"timestamp":{"unix_seconds":1,"utc":"1970-01-01T00:00:01Z"},"event":"summary","counts_as_readout":true,"basis_scanned_at_unix":1,"basis_total_bytes":10,"basis_total_allocated_bytes":20,"basis_file_count":1,"basis_folder_count":1,"basis_elapsed_ms":5}"#,
+        )
+        .expect("write legacy cache usage journal");
+        assert_eq!(
+            load_cache_usage_journal(&paths).expect("legacy usage loads")[0].version,
+            CACHE_USAGE_JOURNAL_VERSION
+        );
+
+        fs::write(
+            &paths.cleanup_journal_path,
+            r#"{"version":2,"timestamp":{"unix_seconds":1,"utc":"1970-01-01T00:00:01Z"},"target_type":"file","path":"new.bin","removed_files":1,"removed_folders":0,"bytes":10,"allocated_bytes":20,"human_size":"10 B","human_on_disk":"20 B","entry":{"path":"new.bin","bytes":10,"allocated_bytes":20,"files":null,"category":"Other"}}"#,
+        )
+        .expect("write future cleanup journal");
+        let err = load_cleanup_journal(&paths).expect_err("future cleanup should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported cleanup journal version 2")
+        );
+
+        fs::write(
+            &paths.cache_usage_journal_path,
+            r#"{"version":2,"timestamp":{"unix_seconds":1,"utc":"1970-01-01T00:00:01Z"},"event":"summary","counts_as_readout":true,"basis_scanned_at_unix":1,"basis_total_bytes":10,"basis_total_allocated_bytes":20,"basis_file_count":1,"basis_folder_count":1,"basis_elapsed_ms":5}"#,
+        )
+        .expect("write future cache usage journal");
+        let err = load_cache_usage_journal(&paths).expect_err("future usage should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported cache usage journal version 2")
+        );
     }
 
     fn sized_entry(path: &str, bytes: u64, allocated_bytes: u64) -> SizedEntry {

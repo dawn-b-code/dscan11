@@ -5,14 +5,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dscan11::{
-    CachePaths, CacheUsageEventKind, CategoryConfigBootstrap, CliError, NavigationTarget,
-    OutputMode, StaleInfo, WorkspaceView, cache_paths, cache_paths_for_workspace, create_workspace,
-    current_workspace, delete_workspace, discover_default_roots, fast_forward_cache,
-    init_category_config, list_workspaces, load_category_rules, load_or_default_config,
-    load_snapshot, open_cached_path, print_browse, print_cleanup_journal, print_config,
-    print_files, print_folders, print_json, print_status, print_summary, record_cache_usage,
-    rename_workspace, restore_base_cache, roots_match, save_config, save_full_scan, scan_paths,
-    use_workspace, validate_workspace_name, workspace_exists,
+    APP_VERSION, CachePaths, CacheUsageEventKind, CategoryConfigBootstrap, CliError,
+    NavigationTarget, OutputMode, StaleInfo, WorkspaceView, cache_paths, cache_paths_for_workspace,
+    create_workspace, current_workspace, delete_workspace, discover_default_roots,
+    fast_forward_cache, init_category_config, list_workspaces, load_category_rules,
+    load_or_default_config, load_snapshot, open_cached_path, print_browse, print_cleanup_journal,
+    print_config, print_files, print_folders, print_json, print_status, print_summary,
+    record_cache_usage, rename_workspace, restore_base_cache, roots_match, save_config,
+    save_full_scan, scan_paths, use_workspace, validate_workspace_name, workspace_exists,
 };
 
 struct Cli {
@@ -465,6 +465,11 @@ impl Drop for ScanHeartbeat {
 }
 
 fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        println!("dscan11 {APP_VERSION}");
+        std::process::exit(0);
+    }
+
     if args.is_empty() || args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_help();
         std::process::exit(0);
@@ -732,6 +737,8 @@ Usage:
   dscan11 [GLOBAL OPTIONS] <COMMAND> [COMMAND OPTIONS]
   dscan11 --help
   dscan11 -h
+  dscan11 --version
+  dscan11 -V
 
 Global options:
   --json
@@ -748,6 +755,9 @@ Global options:
 
   -h, --help
       Show this help page.
+
+  -V, --version
+      Show the dscan11 version.
 
 Commands:
   scan [--force] [--top N] [paths...]
@@ -936,6 +946,11 @@ Cache and config:
   Category config:
       %LOCALAPPDATA%\dscan11\categories.json
       Optional path_rules classify known storage roots before extensions.
+
+  Companion file versions:
+      Config, category config, workspace registry, snapshots, and journals
+      include schema versions. Missing versions are treated as legacy v1;
+      newer unsupported versions fail with a clear refresh or upgrade message.
 
   Defaults:
       stale_days: 15
