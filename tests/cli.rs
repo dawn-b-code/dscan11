@@ -20,7 +20,7 @@ fn version_flags_print_package_version_without_touching_cache() {
         );
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
-            "dscan11 0.10.0"
+            "dscan11 0.11.0"
         );
         assert!(
             !cache.join("dscan11").exists(),
@@ -103,7 +103,7 @@ fn status_reports_cache_tracking_and_savings_without_counting_status() {
     assert_success(summary, "Disk Images / VMs");
 
     let first_status = status_json(&cache);
-    assert_eq!(first_status["app_version"].as_str(), Some("0.10.0"));
+    assert_eq!(first_status["app_version"].as_str(), Some("0.11.0"));
     assert_eq!(first_status["snapshot_schema_version"].as_u64(), Some(3));
     assert_eq!(first_status["cache_mode"].as_str(), Some("base_scan"));
     assert!(
@@ -214,6 +214,183 @@ fn json_limit_applies_to_cached_views() {
     );
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout).expect("files emits JSON");
     assert_eq!(rows.as_array().expect("array").len(), 1);
+}
+
+#[test]
+fn cache_mark_removed_folder_updates_active_snapshot_and_journal_only() {
+    let cache = temp_dir("mark-folder-cache");
+    let tree = temp_dir("mark-folder-tree");
+    let gone = tree.join("gone");
+    std::fs::create_dir_all(&gone).expect("create gone folder");
+    std::fs::write(gone.join("big.bin"), vec![0; 8_192]).expect("write big");
+    std::fs::write(tree.join("keep.bin"), vec![0; 1_024]).expect("write keep");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache)
+        .arg("scan")
+        .arg("--top")
+        .arg("10")
+        .arg(&tree);
+    assert_success(scan, "Scan status");
+    std::fs::remove_dir_all(&gone).expect("remove gone folder");
+
+    let mut mark = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    mark.env("LOCALAPPDATA", &cache)
+        .arg("cache")
+        .arg("mark-removed")
+        .arg("folder")
+        .arg("--path")
+        .arg(&gone)
+        .arg("--yes");
+    assert_success(mark, "Tracked removal");
+
+    let active = workspace_json(&cache, "snapshot.json");
+    let base = workspace_json(&cache, "base-snapshot.json");
+    assert!(
+        !snapshot_paths(&active, "largest_folders").contains(&gone.display().to_string()),
+        "active snapshot should no longer contain removed folder"
+    );
+    assert!(
+        snapshot_paths(&base, "largest_folders").contains(&gone.display().to_string()),
+        "base snapshot should remain unchanged"
+    );
+
+    let cleanup = std::fs::read_to_string(
+        cache
+            .join("dscan11")
+            .join("workspaces")
+            .join("default")
+            .join("cleanup-journal.jsonl"),
+    )
+    .expect("read cleanup journal");
+    assert!(
+        cleanup.contains("\"target_type\":\"folder\""),
+        "journal should record folder removal:\n{cleanup}"
+    );
+    assert_eq!(
+        status_json(&cache)["manual_cleanups"]["events"].as_u64(),
+        Some(1)
+    );
+}
+
+#[test]
+fn cache_mark_removed_file_supports_json_output() {
+    let cache = temp_dir("mark-file-cache");
+    let tree = temp_dir("mark-file-tree");
+    let gone = tree.join("old.iso");
+    std::fs::write(&gone, vec![0; 8_192]).expect("write old iso");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache).arg("scan").arg(&tree);
+    assert_success(scan, "Scan status");
+    std::fs::remove_file(&gone).expect("remove old iso");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("cache")
+        .arg("mark-removed")
+        .arg("file")
+        .arg("--path")
+        .arg(&gone)
+        .arg("--yes")
+        .output()
+        .expect("run mark removed");
+    assert!(
+        output.status.success(),
+        "mark removed failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("mark removed emits JSON");
+    assert_eq!(result["removed"].as_bool(), Some(true));
+    assert_eq!(result["target_type"].as_str(), Some("file"));
+    assert_eq!(
+        result["path"].as_str(),
+        Some(gone.display().to_string().as_str())
+    );
+    assert_eq!(result["removed_files"].as_u64(), Some(1));
+
+    let files = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("files")
+        .output()
+        .expect("run files");
+    assert!(files.status.success(), "files should succeed");
+    let rows: serde_json::Value = serde_json::from_slice(&files.stdout).expect("files JSON");
+    assert!(
+        !rows
+            .as_array()
+            .expect("file rows")
+            .iter()
+            .any(|row| row["path"].as_str() == Some(gone.display().to_string().as_str())),
+        "active files should no longer contain removed file"
+    );
+}
+
+#[test]
+fn cache_mark_removed_fails_without_confirmation_for_existing_or_uncached_paths() {
+    let cache = temp_dir("mark-failure-cache");
+    let tree = temp_dir("mark-failure-tree");
+    let cached = tree.join("cached.iso");
+    let uncached = tree.join("uncached.iso");
+    std::fs::write(&cached, vec![0; 8_192]).expect("write cached");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache).arg("scan").arg(&tree);
+    assert_success(scan, "Scan status");
+
+    let missing_yes = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("cache")
+        .arg("mark-removed")
+        .arg("file")
+        .arg("--path")
+        .arg(&cached)
+        .output()
+        .expect("run missing yes");
+    assert!(!missing_yes.status.success(), "missing --yes should fail");
+    assert!(
+        String::from_utf8_lossy(&missing_yes.stderr).contains("rerun with --yes"),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&missing_yes.stderr)
+    );
+
+    let still_exists = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("cache")
+        .arg("mark-removed")
+        .arg("file")
+        .arg("--path")
+        .arg(&cached)
+        .arg("--yes")
+        .output()
+        .expect("run still exists");
+    assert!(!still_exists.status.success(), "existing path should fail");
+    assert!(
+        String::from_utf8_lossy(&still_exists.stderr).contains("still exists on disk"),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&still_exists.stderr)
+    );
+
+    let not_cached = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("cache")
+        .arg("mark-removed")
+        .arg("file")
+        .arg("--path")
+        .arg(&uncached)
+        .arg("--yes")
+        .output()
+        .expect("run uncached");
+    assert!(!not_cached.status.success(), "uncached path should fail");
+    assert!(
+        String::from_utf8_lossy(&not_cached.stderr).contains("path not found in active snapshot"),
+        "unexpected stderr:\n{}",
+        String::from_utf8_lossy(&not_cached.stderr)
+    );
 }
 
 #[test]
@@ -409,6 +586,259 @@ fn companion_files_are_versioned_and_legacy_files_still_load() {
     )
     .expect("categories json");
     assert_eq!(saved_categories["version"].as_u64(), Some(1));
+}
+
+#[test]
+fn audit_json_reports_thresholds_generated_outputs_and_reuses_fresh_cache_quietly() {
+    let cache = temp_dir("audit-cache");
+    let tree = temp_dir("audit-tree");
+    let project = tree.join("project");
+    let target = project.join("target");
+    let git_objects = project.join(".git").join("objects");
+    std::fs::create_dir_all(&target).expect("create target");
+    std::fs::create_dir_all(&git_objects).expect("create git objects");
+    std::fs::write(project.join("main.rs"), vec![0; 2_048]).expect("write source");
+    std::fs::write(target.join("artifact.bin"), vec![0; 2_048]).expect("write target");
+    std::fs::write(git_objects.join("blob"), vec![0; 2_048]).expect("write git object");
+    let rules = tree.join("rules.json");
+    std::fs::write(
+        &rules,
+        r#"{
+  "known_top_level_folders": ["project"],
+  "generated_path_names": ["target"],
+  "projects": [
+    {
+      "path": "project",
+      "max_size_mb": 0.001,
+      "max_git_size_mb": 0.001,
+      "watch_generated_outputs": true
+    }
+  ]
+}"#,
+    )
+    .expect("write rules");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("--quiet")
+        .arg("--limit")
+        .arg("3")
+        .arg("audit")
+        .arg(&tree)
+        .arg("--rules")
+        .arg(&rules)
+        .output()
+        .expect("run audit");
+    assert!(
+        output.status.success(),
+        "audit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        "",
+        "quiet audit should not write successful status notes to stderr"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON object");
+    assert_eq!(report["schema_version"].as_u64(), Some(1));
+    assert_eq!(report["command"].as_str(), Some("audit"));
+    assert_eq!(report["workspace"].as_str(), Some("default"));
+    assert_eq!(report["reused_cached_scan"].as_bool(), Some(false));
+    assert!(
+        report["largest_folders"]
+            .as_array()
+            .is_some_and(|rows| rows.len() <= 3),
+        "audit should respect --limit for largest_folders"
+    );
+    let rule_ids = report["alerts"]
+        .as_array()
+        .expect("alerts array")
+        .iter()
+        .filter_map(|alert| alert["rule_id"].as_str())
+        .collect::<Vec<_>>();
+    for expected in ["project_size", "git_size", "generated_output"] {
+        assert!(
+            rule_ids.contains(&expected),
+            "audit alerts did not include {expected:?}: {report:#}"
+        );
+    }
+
+    let second = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("--quiet")
+        .arg("audit")
+        .arg(&tree)
+        .arg("--rules")
+        .arg(&rules)
+        .output()
+        .expect("run second audit");
+    assert!(
+        second.status.success(),
+        "second audit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&second.stderr).trim(), "");
+    let second_report: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("second audit emits JSON");
+    assert_eq!(
+        second_report["reused_cached_scan"].as_bool(),
+        Some(true),
+        "fresh audit should reuse the existing scan"
+    );
+}
+
+#[test]
+fn audit_json_reports_no_alerts_for_clean_project() {
+    let cache = temp_dir("audit-clean-cache");
+    let tree = temp_dir("audit-clean-tree");
+    let project = tree.join("project");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(project.join("notes.txt"), vec![0; 128]).expect("write notes");
+    let rules = tree.join("rules.json");
+    std::fs::write(
+        &rules,
+        r#"{
+  "known_top_level_folders": ["project"],
+  "generated_path_names": ["target"],
+  "projects": [
+    {
+      "path": "project",
+      "max_size_mb": 10,
+      "max_git_size_mb": 10,
+      "watch_generated_outputs": true
+    }
+  ]
+}"#,
+    )
+    .expect("write rules");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("--json")
+        .arg("audit")
+        .arg(&tree)
+        .arg("--rules")
+        .arg(&rules)
+        .output()
+        .expect("run audit");
+    assert!(
+        output.status.success(),
+        "audit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("audit emits JSON");
+    assert_eq!(report["alerts"].as_array().map(Vec::len), Some(0));
+}
+
+#[test]
+fn audit_requires_readable_rules_file() {
+    let cache = temp_dir("audit-missing-rules-cache");
+    let tree = temp_dir("audit-missing-rules-tree");
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", &cache)
+        .arg("audit")
+        .arg(&tree)
+        .arg("--rules")
+        .arg(tree.join("missing-rules.json"))
+        .output()
+        .expect("run audit");
+
+    assert!(!output.status.success(), "missing rules should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read audit rules"),
+        "unexpected stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn audit_rules_validate_init_and_from_inventory_work_for_agents() {
+    let dir = temp_dir("audit-rules-tools");
+    let rules = dir.join("rules.json");
+
+    let init = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .arg("audit")
+        .arg("rules")
+        .arg("init")
+        .arg(&rules)
+        .output()
+        .expect("run rules init");
+    assert!(
+        init.status.success(),
+        "rules init failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(rules.exists(), "rules init should create file");
+
+    let validate = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .arg("--json")
+        .arg("audit")
+        .arg("rules")
+        .arg("validate")
+        .arg(&rules)
+        .output()
+        .expect("run rules validate");
+    assert!(
+        validate.status.success(),
+        "rules validate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&validate.stdout),
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let validation: serde_json::Value =
+        serde_json::from_slice(&validate.stdout).expect("validation emits JSON");
+    assert_eq!(validation["valid"].as_bool(), Some(true));
+
+    let inventory = dir.join("WORKSPACE_INVENTORY.md");
+    std::fs::write(
+        &inventory,
+        r#"# Workspace Inventory
+
+### `cli-tools\dscan11`
+- `Classification`: cli-tool-project
+
+### `snowflake-gradebook`
+- `Classification`: coder-project
+"#,
+    )
+    .expect("write inventory");
+    let generated = dir.join("generated-rules.json");
+    let from_inventory = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .arg("audit")
+        .arg("rules")
+        .arg("from-inventory")
+        .arg(&inventory)
+        .arg("--out")
+        .arg(&generated)
+        .output()
+        .expect("run from-inventory");
+    assert!(
+        from_inventory.status.success(),
+        "from-inventory failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&from_inventory.stdout),
+        String::from_utf8_lossy(&from_inventory.stderr)
+    );
+    let generated_rules: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&generated).expect("read generated rules"))
+            .expect("generated rules JSON");
+    assert_eq!(
+        generated_rules["projects"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        generated_rules["known_top_level_folders"]
+            .as_array()
+            .expect("known folders")
+            .iter()
+            .any(|folder| folder.as_str() == Some("cli-tools"))
+    );
 }
 
 #[test]
@@ -832,17 +1262,23 @@ fn help_documents_commands_flags_and_examples() {
         "Usage:",
         "Global options:",
         "--version",
+        "--quiet",
         "--workspace NAME",
         "Commands:",
         "scan [--force] [--top N] [paths...]",
         "summary",
         "files",
         "folders",
+        "audit PATH --rules RULES.json",
+        "audit rules validate RULES.json",
+        "audit rules init RULES.json",
+        "audit rules from-inventory INVENTORY.md",
         "open file N",
         "open folder N",
         "browse",
         "cache restore-base",
         "cache fast-forward",
+        "cache mark-removed file|folder --path PATH --yes",
         "workspace list",
         "workspace create NAME",
         "workspace delete [--force] NAME",
@@ -850,6 +1286,7 @@ fn help_documents_commands_flags_and_examples() {
         "config [--stale-days DAYS] [--init-categories]",
         "--top controls how much scan data is stored.",
         "--limit controls how much cached data is displayed.",
+        "--quiet suppresses successful automation notes on stderr.",
         "JSON output respects --limit",
         "Companion file versions:",
         "Exit codes:",
@@ -878,6 +1315,9 @@ fn readme_uses_generic_public_paths() {
     );
     assert!(readme.contains(r"C:\Users\Example"));
     assert!(readme.contains("dscan11 --version"));
+    assert!(readme.contains("dscan11 --workspace ai-dev-audit --json --quiet audit"));
+    assert!(readme.contains("dscan11 audit rules validate audit-rules.json"));
+    assert!(readme.contains("cache mark-removed folder --path"));
     assert!(readme.contains("dscan11 status"));
     assert!(readme.contains("where.exe dscan11"));
     assert!(!readme.contains("where.exe dscan11.exe"));
@@ -935,6 +1375,25 @@ fn status_json(cache: &PathBuf) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("status emits JSON")
+}
+
+fn workspace_json(cache: &PathBuf, name: &str) -> serde_json::Value {
+    let path = cache
+        .join("dscan11")
+        .join("workspaces")
+        .join("default")
+        .join(name);
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("read workspace JSON"))
+        .expect("workspace JSON")
+}
+
+fn snapshot_paths(snapshot: &serde_json::Value, key: &str) -> Vec<String> {
+    snapshot[key]
+        .as_array()
+        .expect("snapshot path array")
+        .iter()
+        .filter_map(|row| row["path"].as_str().map(str::to_string))
+        .collect()
 }
 
 fn temp_dir(name: &str) -> PathBuf {

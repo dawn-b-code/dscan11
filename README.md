@@ -36,6 +36,7 @@ dscan11 scan C:\Users\Example
 dscan11 summary
 dscan11 files
 dscan11 folders
+dscan11 --workspace ai-dev-audit --json --quiet audit C:\Users\Example --rules audit-rules.json
 dscan11 open file 1
 dscan11 open folder 1
 dscan11 status
@@ -64,12 +65,49 @@ usage journal for savings estimates.
 Online-only OneDrive/cloud placeholders count as `0 B` on disk until they are
 hydrated locally.
 
+Audit mode is built for storage oversight agents. Use a dedicated workspace for
+the audit scope, pass one root path plus `--rules RULES.json`, and prefer
+`--json --quiet` for automation:
+
+```powershell
+dscan11 --workspace ai-dev-audit --json --quiet audit C:\Users\Example --rules audit-rules.json
+```
+
+Audit reports use an object-shaped JSON envelope with schema version, command,
+workspace, roots, generated timestamp, alerts, largest folders, and any
+available project growth deltas. The rules file can define
+`known_top_level_folders`, shared `generated_path_names`, and `projects` with
+`path`, `max_size_mb`, `max_git_size_mb`, `growth_alert_mb`, and
+`watch_generated_outputs`. Audit mode reports only; it never deletes files or
+updates cleanup journals.
+
+Audit rule helpers let external agents validate or bootstrap policy files:
+
+```powershell
+dscan11 audit rules validate audit-rules.json
+dscan11 audit rules init audit-rules.json
+dscan11 audit rules from-inventory WORKSPACE_INVENTORY.md --out audit-rules.json
+```
+
 When you confirm removal of a missing cached file or folder, `dscan11` writes an
 append-only cleanup journal and updates only the active cache snapshot. The last
 full scan remains available as `base-snapshot.json`, so `dscan11 cache
 restore-base` can return to the original scan and `dscan11 cache fast-forward`
 can replay the tracked manual removals back to the present state. Use `dscan11
 cache cleanups` to list the manually tracked removals so far.
+
+Agents and scripts can mark already-deleted cached paths without Explorer or an
+interactive prompt:
+
+```powershell
+dscan11 --workspace ai-dev-audit cache mark-removed folder --path "C:\Users\Example\project\.venv" --yes
+dscan11 --workspace ai-dev-audit --json cache mark-removed file --path "C:\Users\Example\Downloads\old.iso" --yes
+```
+
+`--yes` confirms that the path is already gone from disk and allows dscan11 to
+append the cleanup journal entry and update only the active cache snapshot. The
+command fails if the path still exists or is not present in the active cached
+top-N file/folder list.
 
 Each workspace tracks one scan scope. If you try to scan different roots into a
 workspace that already has a snapshot, interactive terminals will suggest

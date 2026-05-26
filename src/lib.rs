@@ -18,8 +18,10 @@ pub const CATEGORY_CONFIG_VERSION: u32 = 1;
 pub const WORKSPACE_REGISTRY_VERSION: u32 = 1;
 pub const CLEANUP_JOURNAL_VERSION: u32 = 1;
 pub const CACHE_USAGE_JOURNAL_VERSION: u32 = 1;
+pub const AUDIT_REPORT_VERSION: u32 = 1;
 const DEFAULT_STALE_DAYS: u64 = 15;
 const DEFAULT_TOP_LIMIT: usize = 1_000;
+const DEFAULT_AUDIT_TOP_LIMIT: usize = 10_000;
 const APP_DIR_NAME: &str = "dscan11";
 const WORKSPACES_DIR_NAME: &str = "workspaces";
 const WORKSPACE_REGISTRY_FILE: &str = "workspaces.json";
@@ -1155,6 +1157,16 @@ pub struct ManualCleanupTotals {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MarkRemovedResult {
+    pub removed: bool,
+    pub target_type: String,
+    pub path: String,
+    pub removed_files: usize,
+    pub removed_folders: usize,
+    pub snapshot_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CacheSavingsTotals {
     pub counted_readouts: usize,
     pub estimated_logical_bytes_not_rewalked: u64,
@@ -1235,6 +1247,100 @@ impl PartialOrd for SizedEntry {
 pub struct SkippedPath {
     pub path: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditRules {
+    #[serde(default)]
+    pub schema_version: Option<u32>,
+    #[serde(default)]
+    pub audit_workspace: Option<String>,
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub default_thresholds: AuditDefaultThresholds,
+    #[serde(default)]
+    pub generated_path_names: Vec<String>,
+    #[serde(default)]
+    pub known_top_level_folders: Vec<String>,
+    #[serde(default)]
+    pub projects: Vec<AuditProjectRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AuditDefaultThresholds {
+    #[serde(default)]
+    pub max_size_mb: Option<f64>,
+    #[serde(default)]
+    pub max_git_size_mb: Option<f64>,
+    #[serde(default)]
+    pub growth_alert_mb: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditProjectRule {
+    pub path: String,
+    #[serde(default)]
+    pub classification: Option<String>,
+    #[serde(default)]
+    pub max_size_mb: Option<f64>,
+    #[serde(default)]
+    pub max_git_size_mb: Option<f64>,
+    #[serde(default)]
+    pub growth_alert_mb: Option<f64>,
+    #[serde(default)]
+    pub watch_generated_outputs: bool,
+    #[serde(default)]
+    pub generated_path_names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSeverity {
+    Info,
+    Warning,
+    Alert,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AuditAlert {
+    pub severity: AuditSeverity,
+    pub rule_id: String,
+    pub path: String,
+    pub message: String,
+    pub measured_bytes: Option<u64>,
+    pub threshold_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AuditFolderDelta {
+    pub path: String,
+    pub previous_bytes: u64,
+    pub current_bytes: u64,
+    pub delta_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AuditReport {
+    pub schema_version: u32,
+    pub command: String,
+    pub workspace: String,
+    pub roots: Vec<String>,
+    pub generated_at_unix: u64,
+    pub generated_at_utc: String,
+    pub scanned_at_unix: u64,
+    pub scanned_at_utc: String,
+    pub reused_cached_scan: bool,
+    pub alerts: Vec<AuditAlert>,
+    pub largest_folders: Vec<SizedEntry>,
+    pub growth: Vec<AuditFolderDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuditRulesValidation {
+    pub valid: bool,
+    pub rule_count: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1454,6 +1560,490 @@ pub fn save_full_scan(paths: &CachePaths, snapshot: &Snapshot) -> Result<(), Cli
     reset_active_journals(paths)
 }
 
+pub fn audit_scan_top_limit(config: &AppConfig, display_limit: usize) -> usize {
+    config
+        .top_limit
+        .max(DEFAULT_AUDIT_TOP_LIMIT)
+        .max(display_limit.max(1))
+}
+
+pub fn load_audit_rules(path: &Path) -> Result<AuditRules, CliError> {
+    let contents = fs::read_to_string(path).map_err(|source| CliError::Io {
+        context: format!("failed to read audit rules {}", path.display()),
+        source,
+    })?;
+    serde_json::from_str(&contents).map_err(|source| CliError::Json {
+        context: format!("failed to parse audit rules {}", path.display()),
+        source,
+    })
+}
+
+pub fn validate_audit_rules(rules: &AuditRules) -> Result<AuditRulesValidation, CliError> {
+    if let Some(version) = rules.schema_version {
+        if version > AUDIT_REPORT_VERSION {
+            return Err(CliError::Message(format!(
+                "unsupported audit rules version {version}; this dscan11 supports {AUDIT_REPORT_VERSION}"
+            )));
+        }
+    }
+
+    let mut warnings = Vec::new();
+    let mut seen = HashSet::new();
+    for project in &rules.projects {
+        if project.path.trim().is_empty() {
+            return Err(CliError::Message(
+                "audit project path must not be empty".to_string(),
+            ));
+        }
+        let normalized = project.path.replace('\\', "/").to_ascii_lowercase();
+        if normalized.contains("..") || normalized.starts_with('/') {
+            return Err(CliError::Message(format!(
+                "audit project path `{}` must be relative and must not contain `..`",
+                project.path
+            )));
+        }
+        if !seen.insert(normalized) {
+            warnings.push(format!("duplicate project rule for `{}`", project.path));
+        }
+        for (label, value) in [
+            ("max_size_mb", project.max_size_mb),
+            ("max_git_size_mb", project.max_git_size_mb),
+            ("growth_alert_mb", project.growth_alert_mb),
+        ] {
+            validate_optional_mb(label, value)?;
+        }
+    }
+    for (label, value) in [
+        ("default max_size_mb", rules.default_thresholds.max_size_mb),
+        (
+            "default max_git_size_mb",
+            rules.default_thresholds.max_git_size_mb,
+        ),
+        (
+            "default growth_alert_mb",
+            rules.default_thresholds.growth_alert_mb,
+        ),
+    ] {
+        validate_optional_mb(label, value)?;
+    }
+    Ok(AuditRulesValidation {
+        valid: true,
+        rule_count: rules.projects.len(),
+        warnings,
+    })
+}
+
+fn validate_optional_mb(label: &str, value: Option<f64>) -> Result<(), CliError> {
+    if let Some(value) = value {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CliError::Message(format!(
+                "audit threshold `{label}` must be a non-negative finite number"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn default_audit_rules() -> AuditRules {
+    AuditRules {
+        schema_version: Some(AUDIT_REPORT_VERSION),
+        audit_workspace: None,
+        root: None,
+        default_thresholds: AuditDefaultThresholds {
+            max_size_mb: Some(500.0),
+            max_git_size_mb: Some(100.0),
+            growth_alert_mb: Some(250.0),
+        },
+        generated_path_names: vec![
+            "target".to_string(),
+            "target-fresh".to_string(),
+            ".venv".to_string(),
+            "node_modules".to_string(),
+            "dist".to_string(),
+            ".cache".to_string(),
+        ],
+        known_top_level_folders: Vec::new(),
+        projects: Vec::new(),
+    }
+}
+
+pub fn write_default_audit_rules(path: &Path) -> Result<(), CliError> {
+    if path.exists() {
+        return Err(CliError::Message(format!(
+            "audit rules already exist: {}",
+            path.display()
+        )));
+    }
+    let rules = default_audit_rules();
+    let json = serde_json::to_string_pretty(&rules).map_err(|source| CliError::Json {
+        context: "failed to serialize audit rules".to_string(),
+        source,
+    })?;
+    fs::write(path, json).map_err(|source| CliError::Io {
+        context: format!("failed to write audit rules {}", path.display()),
+        source,
+    })
+}
+
+pub fn audit_rules_from_inventory(path: &Path) -> Result<AuditRules, CliError> {
+    let contents = fs::read_to_string(path).map_err(|source| CliError::Io {
+        context: format!("failed to read workspace inventory {}", path.display()),
+        source,
+    })?;
+    let mut rules = default_audit_rules();
+    let mut current_folder: Option<String> = None;
+    let mut current_classification: Option<String> = None;
+    for line in contents.lines() {
+        if let Some(folder) = parse_inventory_heading(line) {
+            if let Some(previous) = current_folder.replace(folder) {
+                rules.projects.push(inventory_project_rule(
+                    previous,
+                    current_classification.take(),
+                ));
+            }
+        } else if let Some(classification) = parse_inventory_classification(line) {
+            current_classification = Some(classification);
+        }
+    }
+    if let Some(previous) = current_folder {
+        rules.projects.push(inventory_project_rule(
+            previous,
+            current_classification.take(),
+        ));
+    }
+    rules.known_top_level_folders = rules
+        .projects
+        .iter()
+        .filter_map(|project| project.path.split(['\\', '/']).next())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    rules.known_top_level_folders.sort();
+    validate_audit_rules(&rules)?;
+    Ok(rules)
+}
+
+fn inventory_project_rule(path: String, classification: Option<String>) -> AuditProjectRule {
+    let lower = path.to_ascii_lowercase();
+    let (max_size_mb, max_git_size_mb) = if lower.contains("dscan11") {
+        (Some(250.0), Some(25.0))
+    } else {
+        (Some(500.0), Some(100.0))
+    };
+    AuditProjectRule {
+        path,
+        classification,
+        max_size_mb,
+        max_git_size_mb,
+        growth_alert_mb: None,
+        watch_generated_outputs: true,
+        generated_path_names: None,
+    }
+}
+
+fn parse_inventory_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("### `") {
+        return None;
+    }
+    let rest = trimmed.trim_start_matches("### `");
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
+fn parse_inventory_classification(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("- `Classification`:") {
+        return None;
+    }
+    Some(
+        trimmed
+            .trim_start_matches("- `Classification`:")
+            .trim()
+            .to_string(),
+    )
+}
+
+pub fn build_audit_report(
+    paths: &CachePaths,
+    snapshot: &Snapshot,
+    previous_snapshot: Option<&Snapshot>,
+    rules: &AuditRules,
+    limit: usize,
+    reused_cached_scan: bool,
+) -> Result<AuditReport, CliError> {
+    validate_audit_rules(rules)?;
+    let generated_at_unix = current_unix()?;
+    let mut alerts = Vec::new();
+    let root = audit_root(snapshot)?;
+    let folder_index = audit_folder_index(snapshot);
+    let previous_index = previous_snapshot.map(audit_folder_index);
+    let known_top_level = rules
+        .known_top_level_folders
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    if !known_top_level.is_empty() && root.exists() {
+        let entries = fs::read_dir(&root).map_err(|source| CliError::Io {
+            context: format!("failed to read audit root {}", root.display()),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| CliError::Io {
+                context: format!("failed to read entry under {}", root.display()),
+                source,
+            })?;
+            let file_type = entry.file_type().map_err(|source| CliError::Io {
+                context: format!("failed to read type for {}", entry.path().display()),
+                source,
+            })?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git" {
+                continue;
+            }
+            if !known_top_level.contains(&name.to_ascii_lowercase()) {
+                alerts.push(AuditAlert {
+                    severity: AuditSeverity::Warning,
+                    rule_id: "unknown_top_level_folder".to_string(),
+                    path: entry.path().display().to_string(),
+                    message: "Unregistered top-level folder is present under the audit root."
+                        .to_string(),
+                    measured_bytes: None,
+                    threshold_bytes: None,
+                });
+            }
+        }
+    }
+
+    let global_generated = normalized_name_set(&rules.generated_path_names);
+    for project in &rules.projects {
+        let project_path = root.join(&project.path);
+        let project_key = normalize_path_string(&project_path);
+        let project_size = folder_index.get(&project_key).map(|entry| entry.bytes);
+        let max_size = project
+            .max_size_mb
+            .or(rules.default_thresholds.max_size_mb)
+            .and_then(mb_to_bytes);
+        if let (Some(size), Some(threshold)) = (project_size, max_size) {
+            if size > threshold {
+                alerts.push(AuditAlert {
+                    severity: AuditSeverity::Alert,
+                    rule_id: "project_size".to_string(),
+                    path: project_path.display().to_string(),
+                    message: format!(
+                        "Project is {}; threshold is {}.",
+                        human_size(size),
+                        human_size(threshold)
+                    ),
+                    measured_bytes: Some(size),
+                    threshold_bytes: Some(threshold),
+                });
+            }
+        }
+
+        let git_path = project_path.join(".git");
+        let git_key = normalize_path_string(&git_path);
+        let git_size = folder_index.get(&git_key).map(|entry| entry.bytes);
+        let max_git = project
+            .max_git_size_mb
+            .or(rules.default_thresholds.max_git_size_mb)
+            .and_then(mb_to_bytes);
+        if let (Some(size), Some(threshold)) = (git_size, max_git) {
+            if size > threshold {
+                alerts.push(AuditAlert {
+                    severity: AuditSeverity::Alert,
+                    rule_id: "git_size".to_string(),
+                    path: git_path.display().to_string(),
+                    message: format!(
+                        ".git is {}; threshold is {}.",
+                        human_size(size),
+                        human_size(threshold)
+                    ),
+                    measured_bytes: Some(size),
+                    threshold_bytes: Some(threshold),
+                });
+            }
+        }
+
+        if project.watch_generated_outputs {
+            let generated_names = project
+                .generated_path_names
+                .as_ref()
+                .map(|names| normalized_name_set(names))
+                .unwrap_or_else(|| global_generated.clone());
+            if !generated_names.is_empty() {
+                let project_prefix = normalize_path_prefix(&project_path);
+                for entry in &snapshot.largest_folders {
+                    let entry_path = PathBuf::from(&entry.path);
+                    let normalized = normalize_path_string(&entry_path);
+                    if !normalized.starts_with(&project_prefix) {
+                        continue;
+                    }
+                    let Some(name) = entry_path.file_name().and_then(OsStr::to_str) else {
+                        continue;
+                    };
+                    if generated_names.contains(&name.to_ascii_lowercase()) {
+                        alerts.push(AuditAlert {
+                            severity: AuditSeverity::Warning,
+                            rule_id: "generated_output".to_string(),
+                            path: entry.path.clone(),
+                            message: "Generated output folder detected.".to_string(),
+                            measured_bytes: Some(entry.bytes),
+                            threshold_bytes: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let growth = rules
+        .projects
+        .iter()
+        .filter_map(|project| {
+            let previous_index = previous_index.as_ref()?;
+            let project_path = root.join(&project.path);
+            let key = normalize_path_string(&project_path);
+            let current = folder_index.get(&key)?.bytes;
+            let previous = previous_index.get(&key)?.bytes;
+            let delta = current as i128 - previous as i128;
+            let clamped = delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            let threshold = project
+                .growth_alert_mb
+                .or(rules.default_thresholds.growth_alert_mb)
+                .and_then(mb_to_bytes);
+            if let Some(threshold) = threshold {
+                if delta > i128::from(threshold) {
+                    alerts.push(AuditAlert {
+                        severity: AuditSeverity::Warning,
+                        rule_id: "project_growth".to_string(),
+                        path: project_path.display().to_string(),
+                        message: format!(
+                            "Project grew by {}; threshold is {}.",
+                            human_size(delta as u64),
+                            human_size(threshold)
+                        ),
+                        measured_bytes: Some(delta as u64),
+                        threshold_bytes: Some(threshold),
+                    });
+                }
+            }
+            Some(AuditFolderDelta {
+                path: project_path.display().to_string(),
+                previous_bytes: previous,
+                current_bytes: current,
+                delta_bytes: clamped,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(AuditReport {
+        schema_version: AUDIT_REPORT_VERSION,
+        command: "audit".to_string(),
+        workspace: paths.workspace_name.clone(),
+        roots: snapshot.roots.clone(),
+        generated_at_unix,
+        generated_at_utc: format_unix_utc(generated_at_unix)?,
+        scanned_at_unix: snapshot.scanned_at_unix,
+        scanned_at_utc: format_unix_utc(snapshot.scanned_at_unix)?,
+        reused_cached_scan,
+        alerts,
+        largest_folders: snapshot
+            .largest_folders
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect(),
+        growth,
+    })
+}
+
+pub fn print_audit_report(report: &AuditReport, output: OutputMode) -> Result<(), CliError> {
+    if output.is_json() {
+        return print_json(report);
+    }
+
+    println!("Audit report");
+    println!("  workspace: {}", report.workspace);
+    println!("  scanned at: {}", report.scanned_at_utc);
+    println!("  generated at: {}", report.generated_at_utc);
+    println!("  roots: {}", report.roots.join(", "));
+    println!("  alerts: {}", report.alerts.len());
+    if report.alerts.is_empty() {
+        println!("  no audit thresholds were exceeded");
+    } else {
+        println!();
+        println!("Alerts");
+        for alert in &report.alerts {
+            println!("  [{:?}] {}: {}", alert.severity, alert.path, alert.message);
+        }
+    }
+    if !report.largest_folders.is_empty() {
+        println!();
+        println!("Largest folders");
+        for (index, folder) in report.largest_folders.iter().enumerate() {
+            println!(
+                "  {}. {}  {}",
+                index + 1,
+                human_size(folder.bytes),
+                folder.path
+            );
+        }
+    }
+    Ok(())
+}
+
+fn audit_root(snapshot: &Snapshot) -> Result<PathBuf, CliError> {
+    if snapshot.roots.len() != 1 {
+        return Err(CliError::Message(
+            "audit requires a snapshot with exactly one root".to_string(),
+        ));
+    }
+    Ok(PathBuf::from(&snapshot.roots[0]))
+}
+
+fn audit_folder_index(snapshot: &Snapshot) -> HashMap<String, SizedEntry> {
+    snapshot
+        .largest_folders
+        .iter()
+        .cloned()
+        .map(|entry| (normalize_path_string(Path::new(&entry.path)), entry))
+        .collect()
+}
+
+fn normalized_name_set(names: &[String]) -> HashSet<String> {
+    names.iter().map(|name| name.to_ascii_lowercase()).collect()
+}
+
+fn normalize_path_prefix(path: &Path) -> String {
+    let mut value = normalize_path_string(path);
+    if !value.ends_with('/') {
+        value.push('/');
+    }
+    value
+}
+
+fn normalize_path_string(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn mb_to_bytes(mb: f64) -> Option<u64> {
+    if !mb.is_finite() || mb < 0.0 {
+        return None;
+    }
+    Some((mb * 1_048_576.0).round() as u64)
+}
+
 fn archive_tracking_files(paths: &CachePaths) -> Result<(), CliError> {
     let timestamp = current_unix()?;
     fs::create_dir_all(&paths.base_dir).map_err(|source| CliError::Io {
@@ -1521,6 +2111,70 @@ pub fn fast_forward_cache(paths: &CachePaths) -> Result<(), CliError> {
         );
     }
     save_snapshot(paths, &snapshot)
+}
+
+pub fn mark_cached_path_removed(
+    paths: &CachePaths,
+    target: NavigationTarget,
+    path: &Path,
+) -> Result<MarkRemovedResult, CliError> {
+    let mut snapshot = load_snapshot(paths)?;
+    let requested_path = path.display().to_string();
+    let entry = find_cached_entry_by_path(&snapshot, target, &requested_path)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Message(format!(
+                "cached {} path not found in active snapshot: {}",
+                navigation_target_label(target),
+                requested_path
+            ))
+        })?;
+    if path_exists(path)? {
+        return Err(CliError::Message(format!(
+            "cached {} still exists on disk: {}",
+            navigation_target_label(target),
+            requested_path
+        )));
+    }
+
+    let result = prune_cached_entry(&mut snapshot, target, &entry);
+    if result.removed_files == 0 && result.removed_folders == 0 {
+        return Err(CliError::Message(format!(
+            "cached {} path not found in active snapshot: {}",
+            navigation_target_label(target),
+            requested_path
+        )));
+    }
+
+    append_cleanup_journal(paths, target, &entry, &result)?;
+    save_snapshot(paths, &snapshot)?;
+    Ok(MarkRemovedResult {
+        removed: true,
+        target_type: navigation_target_label(target).to_string(),
+        path: entry.path,
+        removed_files: result.removed_files,
+        removed_folders: result.removed_folders,
+        snapshot_path: paths.snapshot_path.display().to_string(),
+    })
+}
+
+fn path_exists(path: &Path) -> Result<bool, CliError> {
+    path.try_exists().map_err(|source| CliError::Io {
+        context: format!("failed to check whether path exists {}", path.display()),
+        source,
+    })
+}
+
+fn find_cached_entry_by_path<'a>(
+    snapshot: &'a Snapshot,
+    target: NavigationTarget,
+    path: &str,
+) -> Option<&'a SizedEntry> {
+    let entries = match target {
+        NavigationTarget::File => &snapshot.largest_files,
+        NavigationTarget::Folder => &snapshot.largest_folders,
+    };
+    entries.iter().find(|entry| same_path(&entry.path, path))
 }
 
 pub fn print_cleanup_journal(paths: &CachePaths, output: OutputMode) -> Result<(), CliError> {

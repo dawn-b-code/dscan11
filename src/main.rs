@@ -6,17 +6,21 @@ use std::time::Duration;
 
 use dscan11::{
     APP_VERSION, CachePaths, CacheUsageEventKind, CategoryConfigBootstrap, CliError,
-    NavigationTarget, OutputMode, StaleInfo, WorkspaceView, cache_paths, cache_paths_for_workspace,
+    NavigationTarget, OutputMode, StaleInfo, WorkspaceView, audit_rules_from_inventory,
+    audit_scan_top_limit, build_audit_report, cache_paths, cache_paths_for_workspace,
     create_workspace, current_workspace, delete_workspace, discover_default_roots,
-    fast_forward_cache, init_category_config, list_workspaces, load_category_rules,
-    load_or_default_config, load_snapshot, open_cached_path, print_browse, print_cleanup_journal,
-    print_config, print_files, print_folders, print_json, print_status, print_summary,
-    record_cache_usage, rename_workspace, restore_base_cache, roots_match, save_config,
-    save_full_scan, scan_paths, use_workspace, validate_workspace_name, workspace_exists,
+    fast_forward_cache, init_category_config, list_workspaces, load_audit_rules,
+    load_category_rules, load_or_default_config, load_snapshot, mark_cached_path_removed,
+    open_cached_path, print_audit_report, print_browse, print_cleanup_journal, print_config,
+    print_files, print_folders, print_json, print_status, print_summary, record_cache_usage,
+    rename_workspace, restore_base_cache, roots_match, save_config, save_full_scan, scan_paths,
+    use_workspace, validate_audit_rules, validate_workspace_name, workspace_exists,
+    write_default_audit_rules,
 };
 
 struct Cli {
     json: bool,
+    quiet: bool,
     limit: usize,
     workspace: Option<String>,
     command: Commands,
@@ -31,6 +35,13 @@ enum Commands {
     Summary,
     Files,
     Folders,
+    Audit {
+        path: PathBuf,
+        rules: PathBuf,
+    },
+    AuditRules {
+        action: AuditRulesAction,
+    },
     Open {
         target: NavigationTarget,
         index: usize,
@@ -53,6 +64,11 @@ enum CacheAction {
     RestoreBase,
     FastForward,
     Cleanups,
+    MarkRemoved {
+        target: NavigationTarget,
+        path: PathBuf,
+        yes: bool,
+    },
 }
 
 enum WorkspaceAction {
@@ -64,6 +80,19 @@ enum WorkspaceAction {
     Delete { name: String, force: bool },
 }
 
+enum AuditRulesAction {
+    Validate {
+        path: PathBuf,
+    },
+    Init {
+        path: PathBuf,
+    },
+    FromInventory {
+        inventory: PathBuf,
+        output: Option<PathBuf>,
+    },
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -73,14 +102,20 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let cli = parse_cli(std::env::args().skip(1).collect())?;
-    let paths = match &cli.command {
+    let output = OutputMode::from_json(cli.json);
+    let command = cli.command;
+
+    if let Commands::AuditRules { action } = command {
+        return handle_audit_rules(action, output);
+    }
+
+    let paths = match &command {
         Commands::Workspace { .. } => cache_paths()?,
         _ => cache_paths_for_workspace(cli.workspace.as_deref())?,
     };
     let mut config = load_or_default_config(&paths)?;
-    let output = OutputMode::from_json(cli.json);
 
-    match cli.command {
+    match command {
         Commands::Scan {
             paths: requested_paths,
             top,
@@ -103,10 +138,12 @@ fn run() -> Result<(), CliError> {
                 if let Ok(snapshot) = load_snapshot(&paths) {
                     let stale = snapshot.stale_info(config.stale_days);
                     if !stale.is_stale && roots_match(&roots, &snapshot.roots) {
-                        eprintln!(
-                            "Cached scan is still fresh ({} days old; stale after {} days).",
-                            stale.age_days, stale.stale_after_days
-                        );
+                        if !cli.quiet {
+                            eprintln!(
+                                "Cached scan is still fresh ({} days old; stale after {} days).",
+                                stale.age_days, stale.stale_after_days
+                            );
+                        }
                         if output.is_json() || !io::stdin().is_terminal() {
                             record_cache_usage(&paths, CacheUsageEventKind::ScanAutoSkip)?;
                             print_status(
@@ -156,6 +193,57 @@ fn run() -> Result<(), CliError> {
             print_folders(&snapshot, output, cli.limit)?;
             record_cache_usage(&paths, CacheUsageEventKind::Folders)?;
         }
+        Commands::Audit { path, rules } => {
+            let roots = vec![path];
+            let rules = load_audit_rules(&rules)?;
+            let category_rules = load_category_rules(&paths)?;
+            let mut reused_cached_scan = false;
+            let mut previous_snapshot = None;
+            let snapshot = match load_snapshot(&paths) {
+                Ok(snapshot) if roots_match(&roots, &snapshot.roots) => {
+                    let stale = snapshot.stale_info(config.stale_days);
+                    if stale.is_stale {
+                        previous_snapshot = Some(snapshot);
+                        let scanned = scan_paths(
+                            &roots,
+                            &config,
+                            &category_rules,
+                            audit_scan_top_limit(&config, cli.limit),
+                        )?;
+                        save_full_scan(&paths, &scanned)?;
+                        scanned
+                    } else {
+                        reused_cached_scan = true;
+                        snapshot
+                    }
+                }
+                Ok(_) => {
+                    return Err(CliError::Message(format!(
+                        "audit path differs from workspace `{}`; create or select a dedicated audit workspace for this scope",
+                        paths.workspace_name
+                    )));
+                }
+                Err(_) => {
+                    let scanned = scan_paths(
+                        &roots,
+                        &config,
+                        &category_rules,
+                        audit_scan_top_limit(&config, cli.limit),
+                    )?;
+                    save_full_scan(&paths, &scanned)?;
+                    scanned
+                }
+            };
+            let report = build_audit_report(
+                &paths,
+                &snapshot,
+                previous_snapshot.as_ref(),
+                &rules,
+                cli.limit,
+                reused_cached_scan,
+            )?;
+            print_audit_report(&report, output)?;
+        }
         Commands::Open { target, index } => {
             if output.is_json() {
                 return Err(CliError::Message(
@@ -199,6 +287,24 @@ fn run() -> Result<(), CliError> {
             }
             CacheAction::Cleanups => {
                 print_cleanup_journal(&paths, output)?;
+            }
+            CacheAction::MarkRemoved { target, path, yes } => {
+                if !yes {
+                    return Err(CliError::Message(
+                        "cache mark-removed changes the saved cache snapshot; rerun with --yes after verifying the path is gone"
+                            .to_string(),
+                    ));
+                }
+                let result = mark_cached_path_removed(&paths, target, &path)?;
+                if output.is_json() {
+                    print_json(&result)?;
+                } else {
+                    println!(
+                        "Tracked removal of {} file(s) and {} folder(s).",
+                        result.removed_files, result.removed_folders
+                    );
+                    println!("Saved updated cache snapshot: {}", result.snapshot_path);
+                }
             }
         },
         Commands::Config {
@@ -275,6 +381,69 @@ fn run() -> Result<(), CliError> {
                 }
             }
         },
+        Commands::AuditRules { .. } => {
+            unreachable!("audit rules commands are handled before cache setup")
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_audit_rules(action: AuditRulesAction, output: OutputMode) -> Result<(), CliError> {
+    match action {
+        AuditRulesAction::Validate { path } => {
+            let rules = load_audit_rules(&path)?;
+            let validation = validate_audit_rules(&rules)?;
+            if output.is_json() {
+                print_json(&validation)?;
+            } else {
+                println!("Audit rules valid: {}", path.display());
+                println!("  project rules: {}", validation.rule_count);
+                for warning in validation.warnings {
+                    println!("  warning: {warning}");
+                }
+            }
+        }
+        AuditRulesAction::Init { path } => {
+            write_default_audit_rules(&path)?;
+            if output.is_json() {
+                print_json(&serde_json::json!({
+                    "created": true,
+                    "path": path.display().to_string(),
+                }))?;
+            } else {
+                println!("Created audit rules: {}", path.display());
+            }
+        }
+        AuditRulesAction::FromInventory {
+            inventory,
+            output: target,
+        } => {
+            let rules = audit_rules_from_inventory(&inventory)?;
+            if let Some(target) = target {
+                let json =
+                    serde_json::to_string_pretty(&rules).map_err(|source| CliError::Json {
+                        context: "failed to serialize audit rules".to_string(),
+                        source,
+                    })?;
+                std::fs::write(&target, json).map_err(|source| CliError::Io {
+                    context: format!("failed to write audit rules {}", target.display()),
+                    source,
+                })?;
+                if output.is_json() {
+                    print_json(&serde_json::json!({
+                        "created": true,
+                        "path": target.display().to_string(),
+                        "project_rules": rules.projects.len(),
+                    }))?;
+                } else {
+                    println!("Created audit rules from inventory: {}", target.display());
+                    println!("  project rules: {}", rules.projects.len());
+                }
+            } else {
+                print_json(&rules)?;
+            }
+        }
     }
 
     Ok(())
@@ -476,6 +645,7 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
     }
 
     let mut json = false;
+    let mut quiet = false;
     let mut limit = 40usize;
     let mut workspace = None;
     let mut positional = Vec::new();
@@ -485,6 +655,10 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
         match args[index].as_str() {
             "--json" => {
                 json = true;
+                index += 1;
+            }
+            "--quiet" | "--no-status-notes" => {
+                quiet = true;
                 index += 1;
             }
             "--limit" => {
@@ -550,6 +724,105 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
         "summary" => Commands::Summary,
         "files" => Commands::Files,
         "folders" => Commands::Folders,
+        "audit" => {
+            if rest.first().is_some_and(|arg| arg == "rules") {
+                if rest.len() < 3 {
+                    return Err(CliError::Message(
+                        "audit rules requires `validate`, `init`, or `from-inventory`".to_string(),
+                    ));
+                }
+                let action = match rest[1].as_str() {
+                    "validate" => {
+                        if rest.len() != 3 {
+                            return Err(CliError::Message(
+                                "audit rules validate requires RULES.json".to_string(),
+                            ));
+                        }
+                        AuditRulesAction::Validate {
+                            path: PathBuf::from(&rest[2]),
+                        }
+                    }
+                    "init" => {
+                        if rest.len() != 3 {
+                            return Err(CliError::Message(
+                                "audit rules init requires RULES.json".to_string(),
+                            ));
+                        }
+                        AuditRulesAction::Init {
+                            path: PathBuf::from(&rest[2]),
+                        }
+                    }
+                    "from-inventory" => {
+                        if rest.len() != 3 && rest.len() != 5 {
+                            return Err(CliError::Message(
+                                "audit rules from-inventory requires INVENTORY.md [--out RULES.json]"
+                                    .to_string(),
+                            ));
+                        }
+                        let mut output = None;
+                        if rest.len() == 5 {
+                            if rest[3] != "--out" {
+                                return Err(CliError::Message(
+                                    "audit rules from-inventory uses --out RULES.json".to_string(),
+                                ));
+                            }
+                            output = Some(PathBuf::from(&rest[4]));
+                        }
+                        AuditRulesAction::FromInventory {
+                            inventory: PathBuf::from(&rest[2]),
+                            output,
+                        }
+                    }
+                    other => {
+                        return Err(CliError::Message(format!(
+                            "unknown audit rules action `{other}`; use `validate`, `init`, or `from-inventory`"
+                        )));
+                    }
+                };
+                return Ok(Cli {
+                    json,
+                    quiet,
+                    limit: limit.max(1),
+                    workspace,
+                    command: Commands::AuditRules { action },
+                });
+            }
+            let mut paths = Vec::new();
+            let mut rules = None;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--rules" => {
+                        let value = rest.get(index + 1).ok_or_else(|| {
+                            CliError::Message("--rules requires a JSON file path".to_string())
+                        })?;
+                        rules = Some(PathBuf::from(value));
+                        index += 2;
+                    }
+                    arg if arg.starts_with("--") => {
+                        return Err(CliError::Message(format!("unknown audit argument `{arg}`")));
+                    }
+                    path => {
+                        paths.push(PathBuf::from(path));
+                        index += 1;
+                    }
+                }
+            }
+            if paths.len() != 1 {
+                return Err(CliError::Message(
+                    "audit requires exactly one path".to_string(),
+                ));
+            }
+            let Some(rules) = rules else {
+                return Err(CliError::Message(
+                    "audit requires --rules RULES.json".to_string(),
+                ));
+            };
+            Commands::Audit {
+                path: paths.remove(0),
+                rules,
+            }
+        }
         "open" => {
             if rest.len() != 2 {
                 return Err(CliError::Message(
@@ -573,19 +846,41 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
         "browse" => Commands::Browse,
         "status" => Commands::Status,
         "cache" => {
-            if rest.len() != 1 {
+            if rest.is_empty() {
                 return Err(CliError::Message(
-                    "cache requires `restore-base`, `fast-forward`, or `cleanups`; run `dscan11 --help`"
+                    "cache requires `restore-base`, `fast-forward`, `cleanups`, or `mark-removed`; run `dscan11 --help`"
                         .to_string(),
                 ));
             }
             let action = match rest[0].as_str() {
-                "restore-base" => CacheAction::RestoreBase,
-                "fast-forward" => CacheAction::FastForward,
-                "cleanups" | "cleanup" | "removals" => CacheAction::Cleanups,
+                "restore-base" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Message(
+                            "cache restore-base does not accept arguments".to_string(),
+                        ));
+                    }
+                    CacheAction::RestoreBase
+                }
+                "fast-forward" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Message(
+                            "cache fast-forward does not accept arguments".to_string(),
+                        ));
+                    }
+                    CacheAction::FastForward
+                }
+                "cleanups" | "cleanup" | "removals" => {
+                    if rest.len() != 1 {
+                        return Err(CliError::Message(
+                            "cache cleanups does not accept arguments".to_string(),
+                        ));
+                    }
+                    CacheAction::Cleanups
+                }
+                "mark-removed" => parse_cache_mark_removed(&rest[1..])?,
                 other => {
                     return Err(CliError::Message(format!(
-                        "unknown cache action `{other}`; use `restore-base`, `fast-forward`, or `cleanups`"
+                        "unknown cache action `{other}`; use `restore-base`, `fast-forward`, `cleanups`, or `mark-removed`"
                     )));
                 }
             };
@@ -719,10 +1014,58 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, CliError> {
 
     Ok(Cli {
         json,
+        quiet,
         limit: limit.max(1),
         workspace,
         command,
     })
+}
+
+fn parse_cache_mark_removed(rest: &[String]) -> Result<CacheAction, CliError> {
+    let Some(kind) = rest.first() else {
+        return Err(CliError::Message(
+            "cache mark-removed requires `file` or `folder`".to_string(),
+        ));
+    };
+    let target = match kind.as_str() {
+        "file" | "files" => NavigationTarget::File,
+        "folder" | "folders" => NavigationTarget::Folder,
+        other => {
+            return Err(CliError::Message(format!(
+                "unknown cache mark-removed target `{other}`; use `file` or `folder`"
+            )));
+        }
+    };
+
+    let mut path = None;
+    let mut yes = false;
+    let mut index = 1;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--path" => {
+                let value = rest.get(index + 1).ok_or_else(|| {
+                    CliError::Message("cache mark-removed --path requires a path".to_string())
+                })?;
+                path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--yes" => {
+                yes = true;
+                index += 1;
+            }
+            other => {
+                return Err(CliError::Message(format!(
+                    "unknown cache mark-removed argument `{other}`"
+                )));
+            }
+        }
+    }
+    let Some(path) = path else {
+        return Err(CliError::Message(
+            "cache mark-removed requires --path PATH".to_string(),
+        ));
+    };
+    Ok(CacheAction::MarkRemoved { target, path, yes })
 }
 
 fn print_help() {
@@ -743,6 +1086,9 @@ Usage:
 Global options:
   --json
       Print machine-readable JSON for commands that display data.
+
+  --quiet, --no-status-notes
+      Suppress successful status notes on stderr for automation.
 
   --workspace NAME
       Use a specific workspace for this command without changing the globally
@@ -803,6 +1149,38 @@ Commands:
           dscan11 --limit 25 folders
           dscan11 --json --limit 25 folders
 
+  audit PATH --rules RULES.json
+      Scan or reuse one cached audit root, apply external JSON rules, and report
+      threshold alerts for automation. Audit mode never deletes files.
+
+      Rules can define known_top_level_folders, generated_path_names, and
+      project entries with path, max_size_mb, max_git_size_mb,
+      growth_alert_mb, and watch_generated_outputs.
+
+      Examples:
+          dscan11 --workspace ai-dev-audit --json --quiet audit C:\Users\Example --rules audit-rules.json
+          dscan11 --workspace ai-dev-audit --limit 20 audit C:\Users\Example --rules audit-rules.json
+
+  audit rules validate RULES.json
+      Validate an audit rules file without scanning.
+
+      Examples:
+          dscan11 audit rules validate audit-rules.json
+          dscan11 --json audit rules validate audit-rules.json
+
+  audit rules init RULES.json
+      Create a starter audit rules file. Existing files are not overwritten.
+
+      Examples:
+          dscan11 audit rules init audit-rules.json
+
+  audit rules from-inventory INVENTORY.md [--out RULES.json]
+      Generate starter audit rules from an oversight workspace inventory.
+
+      Examples:
+          dscan11 audit rules from-inventory WORKSPACE_INVENTORY.md --out audit-rules.json
+          dscan11 --json audit rules from-inventory WORKSPACE_INVENTORY.md
+
   open file N
       Open Explorer at the folder containing the Nth largest cached file. If the
       file still exists, Explorer selects it.
@@ -857,6 +1235,16 @@ Commands:
       Examples:
           dscan11 cache cleanups
           dscan11 --json cache cleanups
+
+  cache mark-removed file|folder --path PATH --yes
+      Mark a cached file or folder as already removed from disk. This appends a
+      cleanup journal entry and updates only the active snapshot; it does not
+      rescan and it does not edit the base snapshot. --yes confirms the path is
+      gone and allows the noninteractive cache update.
+
+      Examples:
+          dscan11 cache mark-removed folder --path C:\Users\Example\project\.venv --yes
+          dscan11 --json cache mark-removed file --path C:\Users\Example\Downloads\old.iso --yes
 
   config [--stale-days DAYS] [--init-categories]
       Show the current config, update the stale-scan warning threshold, or
@@ -958,6 +1346,7 @@ Cache and config:
 
 Important behavior:
   - Cache views never trigger a rescan; successful views are logged for savings estimates.
+  - Audit mode is read-only with respect to scanned files and reports alerts only.
   - Cache savings are estimates based on the latest full scan scope.
   - open and browse navigation use cached file and folder ranks.
   - Fresh cached scans ask before rescanning unless --force is used.
@@ -966,6 +1355,7 @@ Important behavior:
   - Existing singleton cache files are adopted into workspace `default`.
   - --top controls how much scan data is stored.
   - --limit controls how much cached data is displayed.
+  - --quiet suppresses successful automation notes on stderr.
   - Global options must appear before the command.
   - JSON output respects --limit for summary, files, and folders.
 
