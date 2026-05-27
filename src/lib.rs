@@ -3725,9 +3725,14 @@ fn prune_cached_folder(snapshot: &mut Snapshot, entry: &SizedEntry) -> PruneResu
         let removed_file_count = entry.files.unwrap_or(removed_file_entries_len as u64);
         snapshot.file_count = snapshot.file_count.saturating_sub(removed_file_count);
         snapshot.folder_count = snapshot.folder_count.saturating_sub(removed_folders as u64);
+        subtract_folder_from_cached_ancestors(snapshot, entry);
+        let mut preferred_categories = Vec::new();
         for file in &removed_file_entries {
-            subtract_category_file(snapshot, file);
+            if let Some(category) = subtract_category_file(snapshot, file) {
+                preferred_categories.push(category);
+            }
         }
+        reconcile_category_totals(snapshot, &preferred_categories);
     }
 
     PruneResult {
@@ -3742,12 +3747,42 @@ fn subtract_snapshot_file(snapshot: &mut Snapshot, entry: &SizedEntry) {
         .total_allocated_bytes
         .saturating_sub(entry.allocated_bytes);
     snapshot.file_count = snapshot.file_count.saturating_sub(1);
-    subtract_category_file(snapshot, entry);
+    let preferred_categories = subtract_category_file(snapshot, entry)
+        .into_iter()
+        .collect::<Vec<_>>();
+    reconcile_category_totals(snapshot, &preferred_categories);
 }
 
-fn subtract_category_file(snapshot: &mut Snapshot, entry: &SizedEntry) {
+fn subtract_folder_from_cached_ancestors(snapshot: &mut Snapshot, entry: &SizedEntry) {
+    let mut changed = false;
+    for cached in &mut snapshot.largest_folders {
+        if !path_is_under(&entry.path, &cached.path) {
+            continue;
+        }
+        cached.bytes = cached.bytes.saturating_sub(entry.bytes);
+        cached.allocated_bytes = cached.allocated_bytes.saturating_sub(entry.allocated_bytes);
+        if let (Some(cached_files), Some(removed_files)) = (cached.files, entry.files) {
+            cached.files = Some(cached_files.saturating_sub(removed_files));
+        }
+        changed = true;
+    }
+    if changed {
+        sort_largest_folders(&mut snapshot.largest_folders);
+    }
+}
+
+fn sort_largest_folders(largest_folders: &mut [SizedEntry]) {
+    largest_folders.sort_by(|a, b| {
+        b.allocated_bytes
+            .cmp(&a.allocated_bytes)
+            .then_with(|| b.bytes.cmp(&a.bytes))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+fn subtract_category_file(snapshot: &mut Snapshot, entry: &SizedEntry) -> Option<String> {
     let Some(category_name) = entry.category.as_deref() else {
-        return;
+        return None;
     };
     if let Some(category) = snapshot
         .categories
@@ -3762,6 +3797,97 @@ fn subtract_category_file(snapshot: &mut Snapshot, entry: &SizedEntry) {
     }
     snapshot.categories.retain(|category| {
         category.bytes > 0 || category.allocated_bytes > 0 || category.files > 0
+    });
+    Some(category_name.to_string())
+}
+
+fn reconcile_category_totals(snapshot: &mut Snapshot, preferred_categories: &[String]) {
+    let category_bytes = snapshot
+        .categories
+        .iter()
+        .map(|category| category.bytes)
+        .sum::<u64>();
+    let category_allocated_bytes = snapshot
+        .categories
+        .iter()
+        .map(|category| category.allocated_bytes)
+        .sum::<u64>();
+    let category_files = snapshot
+        .categories
+        .iter()
+        .map(|category| category.files)
+        .sum::<u64>();
+
+    subtract_category_excess(
+        &mut snapshot.categories,
+        category_bytes.saturating_sub(snapshot.total_bytes),
+        category_allocated_bytes.saturating_sub(snapshot.total_allocated_bytes),
+        category_files.saturating_sub(snapshot.file_count),
+        preferred_categories,
+    );
+    sort_categories(&mut snapshot.categories);
+}
+
+fn subtract_category_excess(
+    categories: &mut Vec<CategoryTotal>,
+    mut bytes: u64,
+    mut allocated_bytes: u64,
+    mut files: u64,
+    preferred_categories: &[String],
+) {
+    for preferred in preferred_categories {
+        let Some(category) = categories
+            .iter_mut()
+            .find(|category| category.name == *preferred)
+        else {
+            continue;
+        };
+        subtract_from_category(category, &mut bytes, &mut allocated_bytes, &mut files);
+        if bytes == 0 && allocated_bytes == 0 && files == 0 {
+            break;
+        }
+    }
+
+    for category in categories.iter_mut() {
+        subtract_from_category(category, &mut bytes, &mut allocated_bytes, &mut files);
+        if bytes == 0 && allocated_bytes == 0 && files == 0 {
+            break;
+        }
+    }
+    categories.retain(|category| {
+        category.bytes > 0 || category.allocated_bytes > 0 || category.files > 0
+    });
+}
+
+fn subtract_from_category(
+    category: &mut CategoryTotal,
+    bytes: &mut u64,
+    allocated_bytes: &mut u64,
+    files: &mut u64,
+) {
+    if *bytes > 0 {
+        let subtract = category.bytes.min(*bytes);
+        category.bytes -= subtract;
+        *bytes -= subtract;
+    }
+    if *allocated_bytes > 0 {
+        let subtract = category.allocated_bytes.min(*allocated_bytes);
+        category.allocated_bytes -= subtract;
+        *allocated_bytes -= subtract;
+    }
+    if *files > 0 {
+        let subtract = category.files.min(*files);
+        category.files -= subtract;
+        *files -= subtract;
+    }
+}
+
+fn sort_categories(categories: &mut [CategoryTotal]) {
+    categories.sort_by(|a, b| {
+        b.allocated_bytes
+            .cmp(&a.allocated_bytes)
+            .then_with(|| b.bytes.cmp(&a.bytes))
+            .then_with(|| a.name.cmp(&b.name))
     });
 }
 
@@ -4992,40 +5118,55 @@ mod tests {
             version: SNAPSHOT_VERSION,
             scanned_at_unix: current_unix().expect("time"),
             roots: vec![r"C:\cache-test".to_string()],
-            total_bytes: 600,
-            total_allocated_bytes: 900,
+            total_bytes: 750,
+            total_allocated_bytes: 1_200,
             total_capacity_bytes: Some(10_000),
             file_count: 3,
-            folder_count: 3,
+            folder_count: 5,
             categories: vec![CategoryTotal {
                 name: "Other".to_string(),
-                bytes: 100,
-                allocated_bytes: 200,
-                files: 1,
+                bytes: 300,
+                allocated_bytes: 500,
+                files: 2,
             }],
             largest_files: vec![
-                sized_entry(r"C:\cache-test\gone\a.bin", 100, 200),
-                sized_entry(r"C:\cache-test\keep\b.bin", 50, 50),
+                sized_entry(r"C:\cache-test\project\gone\a.bin", 100, 200),
+                sized_entry(r"C:\cache-test\project\gone\child\b.bin", 200, 300),
+                sized_entry(r"C:\cache-test\keep\c.bin", 450, 700),
             ],
             largest_folders: vec![
                 SizedEntry {
-                    path: r"C:\cache-test\gone".to_string(),
-                    bytes: 500,
-                    allocated_bytes: 800,
+                    path: r"C:\cache-test".to_string(),
+                    bytes: 750,
+                    allocated_bytes: 1_200,
+                    files: Some(3),
+                    category: None,
+                },
+                SizedEntry {
+                    path: r"C:\cache-test\project".to_string(),
+                    bytes: 300,
+                    allocated_bytes: 500,
                     files: Some(2),
                     category: None,
                 },
                 SizedEntry {
-                    path: r"C:\cache-test\gone\child".to_string(),
-                    bytes: 100,
-                    allocated_bytes: 200,
+                    path: r"C:\cache-test\project\gone".to_string(),
+                    bytes: 300,
+                    allocated_bytes: 500,
+                    files: Some(2),
+                    category: None,
+                },
+                SizedEntry {
+                    path: r"C:\cache-test\project\gone\child".to_string(),
+                    bytes: 200,
+                    allocated_bytes: 300,
                     files: Some(1),
                     category: None,
                 },
                 SizedEntry {
                     path: r"C:\cache-test\keep".to_string(),
-                    bytes: 50,
-                    allocated_bytes: 50,
+                    bytes: 450,
+                    allocated_bytes: 700,
                     files: Some(1),
                     category: None,
                 },
@@ -5036,7 +5177,7 @@ mod tests {
             category_rules_source: None,
             scan_stats: ScanStats::default(),
         };
-        let entry = snapshot.largest_folders[0].clone();
+        let entry = snapshot.largest_folders[2].clone();
 
         let result = prune_cached_entry(&mut snapshot, NavigationTarget::Folder, &entry);
 
@@ -5047,13 +5188,24 @@ mod tests {
                 removed_folders: 2,
             }
         );
-        assert_eq!(snapshot.total_bytes, 100);
-        assert_eq!(snapshot.total_allocated_bytes, 100);
+        assert_eq!(snapshot.total_bytes, 450);
+        assert_eq!(snapshot.total_allocated_bytes, 700);
         assert_eq!(snapshot.file_count, 1);
-        assert_eq!(snapshot.folder_count, 1);
+        assert_eq!(snapshot.folder_count, 3);
         assert_eq!(snapshot.largest_files.len(), 1);
-        assert_eq!(snapshot.largest_folders.len(), 1);
-        assert_eq!(snapshot.largest_folders[0].path, r"C:\cache-test\keep");
+        assert_eq!(snapshot.largest_folders.len(), 3);
+        assert_eq!(snapshot.largest_folders[0].path, r"C:\cache-test");
+        assert_eq!(snapshot.largest_folders[0].bytes, 450);
+        assert_eq!(snapshot.largest_folders[0].allocated_bytes, 700);
+        assert_eq!(snapshot.largest_folders[0].files, Some(1));
+        assert_eq!(snapshot.largest_folders[1].path, r"C:\cache-test\keep");
+        assert_eq!(snapshot.largest_folders[1].bytes, 450);
+        assert_eq!(snapshot.largest_folders[1].allocated_bytes, 700);
+        assert_eq!(snapshot.largest_folders[1].files, Some(1));
+        assert_eq!(snapshot.largest_folders[2].path, r"C:\cache-test\project");
+        assert_eq!(snapshot.largest_folders[2].bytes, 0);
+        assert_eq!(snapshot.largest_folders[2].allocated_bytes, 0);
+        assert_eq!(snapshot.largest_folders[2].files, Some(0));
     }
 
     #[test]
@@ -5140,6 +5292,99 @@ mod tests {
         let restored = load_snapshot(&paths).expect("restored snapshot");
         assert_eq!(restored, base);
         assert_eq!(cache_mode(&paths, &restored), CacheMode::BaseScan);
+    }
+
+    #[test]
+    fn fast_forward_replays_folder_cleanup_to_cached_ancestors() {
+        let dir = temp_dir("fast_forward_folder_cleanup");
+        let paths = test_cache_paths(&dir);
+        let base = Snapshot {
+            version: SNAPSHOT_VERSION,
+            scanned_at_unix: current_unix().expect("time"),
+            roots: vec![r"C:\cache-test".to_string()],
+            total_bytes: 750,
+            total_allocated_bytes: 1_200,
+            total_capacity_bytes: Some(10_000),
+            file_count: 3,
+            folder_count: 4,
+            categories: vec![CategoryTotal {
+                name: "Other".to_string(),
+                bytes: 750,
+                allocated_bytes: 1_200,
+                files: 3,
+            }],
+            largest_files: vec![
+                sized_entry(r"C:\cache-test\project\gone\a.bin", 100, 200),
+                sized_entry(r"C:\cache-test\project\gone\b.bin", 200, 300),
+                sized_entry(r"C:\cache-test\keep\c.bin", 450, 700),
+            ],
+            largest_folders: vec![
+                SizedEntry {
+                    path: r"C:\cache-test".to_string(),
+                    bytes: 750,
+                    allocated_bytes: 1_200,
+                    files: Some(3),
+                    category: None,
+                },
+                SizedEntry {
+                    path: r"C:\cache-test\project".to_string(),
+                    bytes: 300,
+                    allocated_bytes: 500,
+                    files: Some(2),
+                    category: None,
+                },
+                SizedEntry {
+                    path: r"C:\cache-test\project\gone".to_string(),
+                    bytes: 300,
+                    allocated_bytes: 500,
+                    files: Some(2),
+                    category: None,
+                },
+                SizedEntry {
+                    path: r"C:\cache-test\keep".to_string(),
+                    bytes: 450,
+                    allocated_bytes: 700,
+                    files: Some(1),
+                    category: None,
+                },
+            ],
+            skipped: vec![],
+            access_denied_count: 0,
+            category_rules_fingerprint: None,
+            category_rules_source: None,
+            scan_stats: ScanStats::default(),
+        };
+        save_full_scan(&paths, &base).expect("save full scan");
+        let entry = base.largest_folders[2].clone();
+        append_cleanup_journal(
+            &paths,
+            NavigationTarget::Folder,
+            &entry,
+            &PruneResult {
+                removed_files: 2,
+                removed_folders: 1,
+            },
+        )
+        .expect("append cleanup");
+
+        fast_forward_cache(&paths).expect("fast forward");
+        let tracked = load_snapshot(&paths).expect("tracked snapshot");
+
+        assert_eq!(tracked.total_bytes, 450);
+        assert_eq!(tracked.total_allocated_bytes, 700);
+        assert_eq!(tracked.file_count, 1);
+        assert_eq!(tracked.folder_count, 3);
+        assert_eq!(tracked.largest_files.len(), 1);
+        assert_eq!(tracked.largest_folders[0].path, r"C:\cache-test");
+        assert_eq!(tracked.largest_folders[0].bytes, 450);
+        assert_eq!(tracked.largest_folders[0].allocated_bytes, 700);
+        assert_eq!(tracked.largest_folders[0].files, Some(1));
+        assert_eq!(tracked.largest_folders[1].path, r"C:\cache-test\keep");
+        assert_eq!(tracked.largest_folders[2].path, r"C:\cache-test\project");
+        assert_eq!(tracked.largest_folders[2].bytes, 0);
+        assert_eq!(tracked.largest_folders[2].allocated_bytes, 0);
+        assert_eq!(tracked.largest_folders[2].files, Some(0));
+        assert_eq!(cache_mode(&paths, &tracked), CacheMode::PresentTracked);
     }
 
     #[test]

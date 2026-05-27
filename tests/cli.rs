@@ -274,6 +274,89 @@ fn cache_mark_removed_folder_updates_active_snapshot_and_journal_only() {
 }
 
 #[test]
+fn cache_folder_cleanup_fast_forward_keeps_summary_and_status_consistent() {
+    let cache = temp_dir("mark-folder-summary-cache");
+    let tree = temp_dir("mark-folder-summary-tree");
+    let keep = tree.join("keep");
+    let project = tree.join("project");
+    let gone = project.join("gone");
+    std::fs::create_dir_all(&keep).expect("create keep folder");
+    std::fs::create_dir_all(&gone).expect("create gone folder");
+    for index in 1..=4 {
+        std::fs::write(keep.join(format!("keep{index}.iso")), vec![0; 4_096])
+            .expect("write keep file");
+    }
+    std::fs::write(gone.join("lesson.mp4"), vec![0; 3_072]).expect("write removed video");
+    std::fs::write(gone.join("notes.txt"), vec![0; 2_048]).expect("write removed document");
+    std::fs::write(gone.join("diagram.png"), vec![0; 512]).expect("write uncached removed image");
+
+    let mut scan = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    scan.env("LOCALAPPDATA", &cache)
+        .arg("scan")
+        .arg("--top")
+        .arg("6")
+        .arg(&tree);
+    assert_success(scan, "Scan status");
+    let base_status = status_json(&cache);
+    let base_summary = summary_json(&cache);
+    assert_eq!(
+        sum_json_field(&base_summary, "bytes"),
+        base_status["total_bytes"]
+            .as_u64()
+            .expect("base total bytes")
+    );
+
+    std::fs::remove_dir_all(&gone).expect("remove gone folder");
+    let mut mark = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    mark.env("LOCALAPPDATA", &cache)
+        .arg("cache")
+        .arg("mark-removed")
+        .arg("folder")
+        .arg("--path")
+        .arg(&gone)
+        .arg("--yes");
+    assert_success(mark, "Tracked removal");
+
+    let mut fast_forward = Command::new(env!("CARGO_BIN_EXE_dscan11"));
+    fast_forward
+        .env("LOCALAPPDATA", &cache)
+        .arg("cache")
+        .arg("fast-forward");
+    assert_success(fast_forward, "Fast-forwarded active cache");
+
+    let tracked_status = status_json(&cache);
+    let tracked_summary = summary_json(&cache);
+    let tracked_files = files_json(&cache);
+    let tracked_folders = folders_json(&cache);
+    let keep_total = 4 * 4_096;
+
+    assert_eq!(tracked_status["total_bytes"].as_u64(), Some(keep_total));
+    assert_eq!(tracked_status["file_count"].as_u64(), Some(4));
+    assert_eq!(sum_json_field(&tracked_summary, "bytes"), keep_total);
+    assert_eq!(sum_json_field(&tracked_summary, "files"), 4);
+    assert!(
+        sum_json_field(&tracked_summary, "bytes") < sum_json_field(&base_summary, "bytes"),
+        "summary bytes should be reduced after folder cleanup"
+    );
+    assert!(
+        !json_paths(&tracked_files).contains(&gone.join("lesson.mp4").display().to_string()),
+        "removed folder files should be absent from cached files"
+    );
+    assert!(
+        !json_paths(&tracked_folders).contains(&gone.display().to_string()),
+        "removed folder should be absent from cached folders"
+    );
+    assert_eq!(
+        json_row_by_path(&tracked_folders, &tree.display().to_string())["bytes"].as_u64(),
+        Some(keep_total)
+    );
+    assert_eq!(
+        json_row_by_path(&tracked_folders, &project.display().to_string())["bytes"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
 fn cache_mark_removed_file_supports_json_output() {
     let cache = temp_dir("mark-file-cache");
     let tree = temp_dir("mark-file-tree");
@@ -1375,6 +1458,58 @@ fn status_json(cache: &PathBuf) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("status emits JSON")
+}
+
+fn summary_json(cache: &PathBuf) -> serde_json::Value {
+    command_json(cache, "summary")
+}
+
+fn files_json(cache: &PathBuf) -> serde_json::Value {
+    command_json(cache, "files")
+}
+
+fn folders_json(cache: &PathBuf) -> serde_json::Value {
+    command_json(cache, "folders")
+}
+
+fn command_json(cache: &PathBuf, command_name: &str) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_dscan11"))
+        .env("LOCALAPPDATA", cache)
+        .arg("--json")
+        .arg(command_name)
+        .output()
+        .expect("run JSON command");
+    assert!(
+        output.status.success(),
+        "{command_name} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("command emits JSON")
+}
+
+fn sum_json_field(rows: &serde_json::Value, field: &str) -> u64 {
+    rows.as_array()
+        .expect("JSON rows")
+        .iter()
+        .map(|row| row[field].as_u64().expect("numeric field"))
+        .sum()
+}
+
+fn json_paths(rows: &serde_json::Value) -> Vec<String> {
+    rows.as_array()
+        .expect("JSON rows")
+        .iter()
+        .filter_map(|row| row["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn json_row_by_path<'a>(rows: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+    rows.as_array()
+        .expect("JSON rows")
+        .iter()
+        .find(|row| row["path"].as_str() == Some(path))
+        .expect("row by path")
 }
 
 fn workspace_json(cache: &PathBuf, name: &str) -> serde_json::Value {
